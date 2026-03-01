@@ -1,8 +1,15 @@
-import os
-import sys
-import subprocess
+"""
+SD LoRA Trainer  -  Full Pipeline Suite
+Resize  Caption  Train  Fine-Tune  Generate  Face Edit  Image Edit
+"""
 
-os.system("")
+import os, sys, subprocess, shutil, re, time, json, glob, struct
+import threading, warnings, logging
+from pathlib import Path
+
+os.system("")   # windows needs this or ANSI codes print as garbage
+
+# ── colors ──────────────────────────────────────────────────────
 R    = "\033[91m"
 G    = "\033[92m"
 Y    = "\033[93m"
@@ -11,16 +18,17 @@ W    = "\033[97m"
 DIM  = "\033[2m"
 RST  = "\033[0m"
 BOLD = "\033[1m"
+MAG  = "\033[95m"
 
-def clr(t, c):
-    return f"{c}{t}{RST}"
+def clr(t, col=""):   return col + str(t) + RST
+def sec(title):
+    print("\n" + clr("─" * 58, DIM))
+    print("  " + clr(title, BOLD + W))
+    print(clr("─" * 58, DIM))
+def clear():          os.system("cls" if os.name == "nt" else "clear")
+def pause(m="  press enter..."):  input(m)
 
-def section(title):
-    print(f"\n{clr('─'*60, DIM)}")
-    print(f"  {clr('▸', C)} {clr(title, BOLD)}")
-    print(clr('─'*60, DIM))
-
-
+# ── packages ─────────────────────────────────────────────────────
 PACKAGES = [
     ("tqdm",         "tqdm"),
     ("PIL",          "Pillow"),
@@ -34,1229 +42,1949 @@ PACKAGES = [
     ("torch",        "torch --index-url https://download.pytorch.org/whl/cu121"),
 ]
 
+def can_import(mod):
+    try:    __import__(mod); return True
+    except: return False
 
-def _can_import(module):
-    try:
-        __import__(module)
-        return True
-    except ImportError:
-        return False
+def pip_install(label, args):
+    # pip sends download progress to stderr not stdout which is why
+    # old versions got stuck at 0% - fix is to read both streams in threads
+    cmd  = [sys.executable, "-m", "pip", "install",
+            "--no-warn-script-location", "--no-cache-dir"] + args
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
 
+    pct_re  = re.compile(r"(\d{1,3})%")
+    rate_re = re.compile(r"([\d.]+\s*(?:MB|KB|GB)/s)", re.I)
+    eta_re  = re.compile(r"eta\s+([\d:]+)", re.I)
+    dl_re   = re.compile(r"Downloading https?://\S+/([\S]+?)(?:\s|$)")
+    inst_re = re.compile(r"Installing collected packages:\s*(.+)")
+    req_re  = re.compile(r"Requirement already satisfied:\s*(\S+)")
 
-def _install_with_progress(label, pip_args):
-    import re as _re
-    import time as _time
-    import threading
+    st = {"pct": -1, "name": label[:32], "status": "resolving",
+          "rate": "", "eta": "", "done": False}
 
-    cmd = [sys.executable, "-m", "pip", "install",
-           "--no-warn-script-location"] + pip_args
+    def read(stream):
+        for raw in stream:
+            ln = raw.strip()
+            if not ln: continue
+            m = dl_re.search(ln)
+            if m:  st["name"] = m.group(1)[:32]; st["status"] = "downloading"
+            m = inst_re.search(ln)
+            if m:  st["status"] = "installing"; st["pct"] = 99
+            m = req_re.search(ln)
+            if m:  st["status"] = "cached"; st["pct"] = 100
+            m = pct_re.search(ln)
+            if m:  st["pct"] = int(m.group(1)); st["status"] = "downloading"
+            m = rate_re.search(ln)
+            if m:  st["rate"] = m.group(1)
+            m = eta_re.search(ln)
+            if m:  st["eta"] = m.group(1)
+        stream.close()
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
-    )
+    for s in (proc.stdout, proc.stderr):
+        threading.Thread(target=read, args=(s,), daemon=True).start()
 
-    bar_width  = 28
-    last_pct   = -1
-    last_label = label
-    speed_str  = ""
-    start      = _time.time()
-    last_bytes = [0.0]
+    frames = ["[   ]","[=  ]","[== ]","[===]","[ ==]","[  =]"]
+    bw     = 22
+    tick   = 0
+    t0     = time.time()
 
-    pct_re  = _re.compile(r"(\d+)%")
-    size_re = _re.compile(r"([\d.]+)\s*(MB|KB|GB)", _re.IGNORECASE)
-    pkg_re  = _re.compile(r"Downloading\s+([\w.\-]+(?:\.whl|\.tar\.gz)?)")
+    while proc.poll() is None or tick < 3:
+        if proc.poll() is not None: tick += 1
+        pct     = st["pct"]
+        elapsed = int(time.time() - t0)
 
-    spinning = [True]
-    frames   = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-    tick     = [0]
+        if pct >= 0:
+            filled = int(bw * min(pct,100) / 100)
+            col    = G if pct > 80 else C if pct > 40 else Y
+            bar    = clr("#" * filled + "." * (bw - filled), col)
+            right  = clr(str(pct).rjust(3) + "%", col)
+        else:
+            bar   = clr(frames[tick % len(frames)], C)
+            right = clr(st["status"][:14], DIM)
 
-    def _spin():
-        while spinning[0]:
-            bar   = "░" * bar_width
-            col   = DIM
-            sys.stdout.write(
-                f"\r  {clr(frames[tick[0] % len(frames)], C)} "
-                f"{clr(bar, col)}   0%  "
-                f"{clr(last_label[:32], W)}  {clr('waiting...', DIM)}   "
-            )
-            sys.stdout.flush()
-            tick[0] += 1
-            _time.sleep(0.09)
+        xtra = ""
+        if st["rate"]: xtra += "  " + clr(st["rate"], DIM)
+        if st["eta"]:  xtra += "  eta " + clr(st["eta"], DIM)
 
-    spin_thread = threading.Thread(target=_spin, daemon=True)
-    spin_thread.start()
+        line = ("\r  " + bar + " " + right
+                + "  " + clr(st["name"][:28], W)
+                + xtra + "  " + clr(str(elapsed) + "s", DIM) + "     ")
+        sys.stdout.write(line); sys.stdout.flush()
+        tick += 1; time.sleep(0.1)
 
-    for line in proc.stdout:
-        line = line.strip()
-
-        pkg_m = pkg_re.search(line)
-        if pkg_m:
-            last_label = pkg_m.group(1)
-            spinning[0] = False
-            spin_thread.join()
-
-        pct_m = pct_re.search(line)
-        if pct_m:
-            pct = int(pct_m.group(1))
-            if pct != last_pct:
-                last_pct = pct
-                filled   = int(bar_width * pct / 100)
-                bar      = "█" * filled + "░" * (bar_width - filled)
-                col      = G if pct > 80 else C if pct > 40 else Y
-                sys.stdout.write(
-                    f"\r  {clr('↓', C)} "
-                    f"{clr(bar, col)} {clr(f'{pct:3d}%', col)}  "
-                    f"{clr(last_label[:32], W)}  {clr(speed_str, DIM)}   "
-                )
-                sys.stdout.flush()
-
-        size_matches = size_re.findall(line)
-        if size_matches:
-            try:
-                val, unit = size_matches[-1]
-                val = float(val)
-                if unit.upper() == "GB":
-                    val *= 1024.0
-                elif unit.upper() == "KB":
-                    val /= 1024.0
-                elapsed   = max(_time.time() - start, 0.001)
-                speed     = val / elapsed
-                speed_str = f"{speed:.1f} MB/s" if speed >= 1 else f"{speed*1024:.0f} KB/s"
-            except Exception:
-                pass
-
-    spinning[0] = False
-    spin_thread.join()
     proc.wait()
-
-    if proc.returncode == 0:
-        sys.stdout.write(f"\r  {clr('✓', G)} {clr(label, W)} ready{' '*55}\n")
-    else:
-        sys.stdout.write(f"\r  {clr('!', Y)} {clr(label, W)} may have issues — continuing{' '*40}\n")
+    tag = clr("ok", G) if proc.returncode == 0 else clr("!", Y)
+    sys.stdout.write("\r  " + tag + "  " + clr(label, W)
+                     + "  " + clr(str(int(time.time()-t0)) + "s", DIM) + " " * 50 + "\n")
     sys.stdout.flush()
+    return proc.returncode == 0
 
 
-def bootstrap():
-    section("Checking Dependencies")
-    print(f"  {clr('Scanning for missing packages...', DIM)}\n")
-
-    missing = [(lbl, pip) for mod, pip in PACKAGES
-               for lbl in [pip.split()[0]]
-               if not _can_import(mod)]
-
-    missing = []
+def boot():
+    clear()
+    print(clr("=" * 60, C))
+    print(clr("  SD LoRA Trainer  |  checking dependencies", BOLD))
+    print(clr("=" * 60, C) + "\n")
+    miss = []
     for mod, pip in PACKAGES:
-        if not _can_import(mod):
-            missing.append((mod.replace("PIL", "Pillow").replace("cv2", "opencv-python"), pip))
+        tag = mod.replace("PIL","Pillow").replace("cv2","opencv-python")
+        if can_import(mod): print("  " + clr("ok", G) + "  " + clr(tag, DIM))
+        else:               miss.append((tag, pip))
+    if not miss:
+        print("\n  " + clr("all good, loading...", G) + "\n"); return
+    print("\n  " + clr("installing " + str(len(miss)) + " missing package(s)", Y) + "\n")
+    for lbl, spec in miss:
+        pip_install(lbl, spec.split())
+    print("\n  " + clr("done, starting up...", G) + "\n")
+    time.sleep(0.6)
 
-    if not missing:
-        print(f"  {clr('✓', G)} All dependencies already installed.\n")
-        return
+boot()
 
-    print(f"  {clr(f'Found {len(missing)} package(s) to install:', Y)}\n")
-    for lbl, _ in missing:
-        print(f"    {clr('·', DIM)} {lbl}")
-    print()
-
-    for label, pip_spec in missing:
-        _install_with_progress(label, pip_spec.split())
-
-    print(f"\n  {clr('✓', G)} All packages ready.\n")
-
-
-bootstrap()
-
-
-import glob
-import re
-import time
-import json
-import warnings
-import logging
+# ── real imports ─────────────────────────────────────────────────
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from pathlib import Path
 from datetime import timedelta, datetime
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.optim import AdamW
-
-warnings.filterwarnings("ignore")
-logging.disable(logging.WARNING)
-os.environ["TRANSFORMERS_VERBOSITY"]        = "error"
-os.environ["DIFFUSERS_VERBOSITY"]           = "error"
-os.environ["TOKENIZERS_PARALLELISM"]        = "false"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-
-from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
+from diffusers import (UNet2DConditionModel, AutoencoderKL,
+                       DDPMScheduler, StableDiffusionPipeline,
+                       StableDiffusionImg2ImgPipeline)
 from transformers import CLIPTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
 from safetensors.torch import load_file, save_file
 
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
+os.environ.update({
+    "TRANSFORMERS_VERBOSITY":        "error",
+    "DIFFUSERS_VERBOSITY":           "error",
+    "TOKENIZERS_PARALLELISM":        "false",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+})
+
+try:   import cv2; CV2 = True
+except: CV2 = False
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark         = True
+
+IEXT = ["png","jpg","jpeg","webp","bmp","tiff"]
+VEXT = ["mp4","mov","avi","mkv","webm"]
+MAX_VFRAMES = 10
 
 
-def clear():
-    os.system("cls" if os.name == "nt" else "clear")
+# ── gpu helpers ──────────────────────────────────────────────────
+def gpu_gb():
+    if not torch.cuda.is_available(): return 0.0
+    return torch.cuda.get_device_properties(0).total_memory / 1024**3
+
+def gpu_bar():
+    if not torch.cuda.is_available(): return clr("no GPU", DIM)
+    free = torch.cuda.mem_get_info()[0] / 1024**3
+    tot  = gpu_gb(); used = tot - free
+    n    = 20
+    bar  = "#" * int(n * used/tot) + "." * (n - int(n * used/tot))
+    col  = G if used/tot < .7 else Y if used/tot < .9 else R
+    return clr(bar, col) + "  " + clr(str(round(used,1)), col) + "/" + str(round(tot)) + "GB"
+
+def gpu_used():
+    if not torch.cuda.is_available(): return 0.0
+    return (gpu_gb() - torch.cuda.mem_get_info()[0]/1024**3)
 
 
-def vram_str():
-    if not torch.cuda.is_available():
-        return "CPU"
-    free   = torch.cuda.mem_get_info()[0] / 1024**3
-    total  = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    used   = total - free
-    n      = 20
-    filled = int(n * used / total)
-    bar    = "█" * filled + "░" * (n - filled)
-    col    = G if used / total < .7 else Y if used / total < .9 else R
-    return f"{clr(bar, col)}  {clr(f'{used:.1f}', col)}/{total:.0f}GB"
+# ── model type detection ─────────────────────────────────────────
+# reads safetensors header (8 bytes = header length, then JSON)
+# without loading weights into VRAM so it works on any machine
+
+_PROFILES = {
+    "sd1":  dict(label="SD 1.x  (512px native)",   native=512,  min_res=512,  max_res=768,
+                 safe_rank=128, min_rank=4, safe_bs=2, min_bs=1, te_min_rank=4,  flux=False,
+                 note="was trained at 512px. going above 768 wastes VRAM without much benefit."),
+    "sd2":  dict(label="SD 2.x  (768px native)",   native=768,  min_res=768,  max_res=1024,
+                 safe_rank=128, min_rank=4, safe_bs=2, min_bs=1, te_min_rank=4,  flux=False,
+                 note="was trained at 768px. do not go below 768 or output gets noisy and broken."),
+    "sdxl": dict(label="SDXL  (1024px native)",    native=1024, min_res=1024, max_res=1024,
+                 safe_rank=64,  min_rank=4, safe_bs=1, min_bs=1, te_min_rank=4,  flux=False,
+                 note="was trained at 1024px. going below 1024 breaks generation noticeably."),
+    "flux": dict(label="Flux.1  (1024px native)",  native=1024, min_res=1024, max_res=1024,
+                 safe_rank=32,  min_rank=4, safe_bs=1, min_bs=1, te_min_rank=16, flux=True,
+                 note="1024px minimum. text encoder rank below 16 breaks generation on Flux."),
+}
+_DEFAULT = _PROFILES["sd1"]
 
 
+def detect_local(path):
+    if not path or not os.path.exists(path):
+        return _DEFAULT.copy()
+    try:
+        ext = Path(path).suffix.lower()
+        if ext == ".safetensors":
+            with open(path, "rb") as f:
+                raw = f.read(8)
+                if len(raw) < 8: return _DEFAULT.copy()
+                hlen = struct.unpack("<Q", raw)[0]
+                if hlen > 50_000_000: return _DEFAULT.copy()
+                hdr  = json.loads(f.read(hlen).decode("utf-8", errors="replace"))
+            keys = set(hdr.keys())
+        elif ext in (".pt",".pth",".ckpt"):
+            sd   = torch.load(path, map_location="cpu", weights_only=False)
+            keys = set((sd.get("state_dict", sd) if isinstance(sd, dict) else {}).keys())
+        else:
+            return _DEFAULT.copy()
+
+        if any("double_stream" in k or "single_stream" in k or "img_attn" in k for k in keys):
+            return _PROFILES["flux"].copy()
+        if any("label_emb" in k or "add_embedding" in k for k in keys):
+            return _PROFILES["sdxl"].copy()
+        if any("cond_stage_model.model.transformer" in k or "open_clip" in k.lower() for k in keys):
+            return _PROFILES["sd2"].copy()
+        return _PROFILES["sd1"].copy()
+    except Exception:
+        return _DEFAULT.copy()
+
+
+def detect_from_id(model_id):
+    mid = model_id.lower()
+    if "flux"  in mid:                          return _PROFILES["flux"].copy()
+    if "xl"    in mid or "sdxl" in mid:         return _PROFILES["sdxl"].copy()
+    if "2-1"   in mid or "2.1" in mid or "v2" in mid: return _PROFILES["sd2"].copy()
+    return _PROFILES["sd1"].copy()
+
+
+# ── vram presets (profile-aware) ─────────────────────────────────
+def vram_preset(prof=None):
+    gb = gpu_gb()
+    p  = prof or _DEFAULT
+    nr = p["native"]
+    mr = p["min_res"]
+    def cr(r): return max(r, mr)  # clamp to model minimum
+
+    if gb >= 20:
+        return dict(res=cr(nr),   bs=4, ga=4,  rank=p["safe_rank"], alpha=p["safe_rank"]*2,
+                    nw=8,  steps=16000, save=2000, lr=2e-5,
+                    ur=p["safe_rank"], ua=p["safe_rank"]*2,
+                    tr=min(64,p["safe_rank"]), ta=min(64,p["safe_rank"])*2,
+                    drop=.03, gc=False, label="20GB+  RTX 3090/4090/A5000")
+    elif gb >= 16:
+        return dict(res=cr(min(nr,768)), bs=3, ga=4, rank=min(128,p["safe_rank"]), alpha=min(256,p["safe_rank"]*2),
+                    nw=6,  steps=16000, save=2000, lr=3e-5,
+                    ur=min(128,p["safe_rank"]), ua=min(128,p["safe_rank"])*2,
+                    tr=32, ta=64, drop=.03, gc=False, label="16GB  RTX 3080Ti/4080/A4000")
+    elif gb >= 12:
+        return dict(res=cr(min(nr,768)), bs=2, ga=8, rank=min(64,p["safe_rank"]),  alpha=min(128,p["safe_rank"]*2),
+                    nw=4,  steps=16000, save=2000, lr=3e-5,
+                    ur=min(64,p["safe_rank"]),  ua=min(128,p["safe_rank"]*2),
+                    tr=32, ta=64, drop=.05, gc=True,  label="12GB  RTX 3060Ti/3080/4070")
+    elif gb >= 8:
+        return dict(res=cr(min(nr,512)), bs=1, ga=16, rank=min(32,p["safe_rank"]), alpha=min(64,p["safe_rank"]*2),
+                    nw=2,  steps=16000, save=2000, lr=3e-5,
+                    ur=min(32,p["safe_rank"]), ua=min(64,p["safe_rank"]*2),
+                    tr=16, ta=32, drop=.05, gc=True,  label="8GB   RTX 2080/3060/4060")
+    else:
+        return dict(res=cr(min(nr,512)), bs=1, ga=32, rank=min(16,p["safe_rank"]), alpha=min(32,p["safe_rank"]*2),
+                    nw=2,  steps=16000, save=2000, lr=3e-5,
+                    ur=min(16,p["safe_rank"]), ua=min(32,p["safe_rank"]*2),
+                    tr=8,  ta=16, drop=.05, gc=True,  label="6GB   survival mode")
+
+
+def show_vram_table():
+    sec("GPU Size Recommendations")
+    print("  " + clr("press enter after reading", DIM) + "\n")
+    rows = [
+        ("6GB",  512,  1, 32, 16, "gradient checkpointing on. slow but it works."),
+        ("8GB",  512,  1, 16, 32, "512px only. ~1.5 steps/sec."),
+        ("12GB", 768,  2,  8, 64, "768px comfortable. rank 128 possible."),
+        ("16GB", 768,  3,  4,128, "768px batch 3 is the sweet spot."),
+        ("20GB+",1024, 4,  4,128, "full quality. 1024px batch 4 rank 128."),
+    ]
+    for lbl, res, bs, ga, rk, note in rows:
+        print("  " + clr(lbl.ljust(7), C+BOLD)
+              + clr("res=" + str(res) + "  bs=" + str(bs)
+                    + "  accum=" + str(ga) + "  rank=" + str(rk), W))
+        print("  " + clr("  " + note, DIM) + "\n")
+    gb = gpu_gb()
+    if gb > 0:
+        p = vram_preset()
+        print("  " + clr("your card: " + str(round(gb,1)) + "GB  -> auto-filling for: " + p["label"], Y))
+
+
+# ── header ───────────────────────────────────────────────────────
 def print_header():
     clear()
-    print(clr("╔══════════════════════════════════════════════════════════╗", C))
-    print(clr("║", C) + clr("      SD LoRA Trainer  ·  Train + Fine-Tune               ", BOLD) + clr("║", C))
-    print(clr("║", C) + clr("      RTX Ready  ·  Training  Fine-Tuning  Generation     ", DIM)  + clr("║", C))
-    print(clr("╚══════════════════════════════════════════════════════════╝", C))
-    print()
+    print(clr("=" * 60, C))
+    print(clr("  SD LoRA Trainer  |  Full Pipeline  |  Image Edit  |  Face", BOLD))
+    print(clr("=" * 60, C))
     if torch.cuda.is_available():
-        print(f"  {clr('GPU ', DIM)} {torch.cuda.get_device_properties(0).name}")
-        print(f"  {clr('VRAM', DIM)} {vram_str()}")
+        print("  " + clr("GPU  ", DIM) + torch.cuda.get_device_properties(0).name)
+        print("  " + clr("VRAM ", DIM) + gpu_bar())
     print()
 
+# ── resize ───────────────────────────────────────────────────────
+def run_resize(cfg):
+    sec("Resize Images and Videos")
+    td  = cfg["data_dir"]
+    sd  = cfg.get("before_folder", os.path.join(os.path.dirname(td), "before"))
+    w   = int(cfg.get("resize_w", 512))
+    h   = int(cfg.get("resize_h", 512))
+    sz  = (w, h)
+    ie  = (".png",".jpg",".jpeg",".webp",".bmp")
+    ve  = (".mp4",".avi",".mov",".mkv")
 
-MAX_FRAMES_PER_VIDEO = 10
-VIDEO_EXTENSIONS     = ["mp4", "mov", "avi", "mkv", "webm"]
+    os.makedirs(sd, exist_ok=True)
+    os.makedirs(td, exist_ok=True)
 
+    print("  " + clr("step 1/3  moving to staging...", C))
+    moved = 0
+    for f in os.listdir(td):
+        try:   shutil.move(os.path.join(td, f), os.path.join(sd, f)); moved += 1
+        except Exception as ex: print("  " + clr("skip " + f + " " + str(ex), Y))
+    print("  " + clr("moved " + str(moved) + " files", G) + "\n")
 
-class LatentCacheDataset(Dataset):
-    def __init__(self, folder, tokenizer, vae, resolution, checkpoint_dir):
-        self.tokenizer  = tokenizer
-        self.cache_file = os.path.join(checkpoint_dir, "latent_cache.pt")
-        self.meta_file  = os.path.join(checkpoint_dir, "dataset_meta.json")
-        self.resolution = resolution
+    print("  " + clr("step 2/3  resizing to " + str(w) + "x" + str(h) + "...", C) + "\n")
+    staged    = os.listdir(sd)
+    img_files = [f for f in staged if f.lower().endswith(ie)]
+    vid_files = [f for f in staged if f.lower().endswith(ve)]
+    other     = [f for f in staged if not f.lower().endswith(ie + ve)]
 
-        self.image_paths = []
-        for ext in ["png", "jpg", "jpeg", "webp", "bmp", "tiff"]:
-            self.image_paths += glob.glob(os.path.join(folder, f"*.{ext}"))
+    for f in other:
+        try: shutil.copy2(os.path.join(sd, f), os.path.join(td, f))
+        except: pass
 
-        self.video_paths = []
-        if CV2_AVAILABLE:
-            for ext in VIDEO_EXTENSIONS:
-                self.video_paths += glob.glob(os.path.join(folder, f"*.{ext}"))
+    iok = ifail = 0
+    for f in tqdm(img_files, desc="  images", unit="img", dynamic_ncols=True, colour="cyan"):
+        src = os.path.join(sd, f); dst = os.path.join(td, f)
+        try:
+            with Image.open(src) as img:
+                img.resize(sz, Image.LANCZOS).save(dst, quality=100, subsampling=0)
+            iok += 1
+        except Exception as ex:
+            print("  " + clr("problem: " + f + "  " + str(ex), Y)); ifail += 1
 
-        self.captions = {}
-        for txt in glob.glob(os.path.join(folder, "*.txt")):
-            name = os.path.splitext(os.path.basename(txt))[0]
+    vok = vfail = 0
+    if CV2 and vid_files:
+        for f in tqdm(vid_files, desc="  videos", unit="vid", dynamic_ncols=True, colour="cyan"):
+            src = os.path.join(sd, f); dst = os.path.join(td, f)
             try:
-                with open(txt, "r", encoding="utf-8") as f:
-                    self.captions[name] = f.read().strip()
-            except Exception:
-                continue
+                cap = cv2.VideoCapture(src)
+                if not cap.isOpened(): raise RuntimeError("cant open")
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                out = cv2.VideoWriter(dst, cv2.VideoWriter_fourcc(*"mp4v"), fps, sz)
+                while True:
+                    ret, fr = cap.read()
+                    if not ret: break
+                    out.write(cv2.resize(fr, sz, interpolation=cv2.INTER_AREA))
+                cap.release(); out.release(); vok += 1
+            except Exception as ex:
+                print("  " + clr("video problem: " + f + "  " + str(ex), Y)); vfail += 1
+    elif vid_files:
+        print("  " + clr("opencv missing, " + str(len(vid_files)) + " videos skipped", Y))
 
-        self.transform = transforms.Compose([
-            transforms.Resize(resolution),
-            transforms.CenterCrop(resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3)
-        ])
+    print("\n  " + clr("step 3/3  cleaning staging...", C))
+    for f in os.listdir(sd):
+        try: os.remove(os.path.join(sd, f))
+        except: pass
 
-        self.data = self._prepare_latents(vae)
+    print("  " + clr("done.  images " + str(iok) + " ok " + str(ifail) + " failed   "
+                      "videos " + str(vok) + " ok " + str(vfail) + " failed", G) + "\n")
 
-    def extract_frames(self, video_path):
-        frames = []
-        if not CV2_AVAILABLE:
-            return frames
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return frames
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            cap.release()
-            return frames
-        step = max(1, total_frames // MAX_FRAMES_PER_VIDEO)
-        for i in range(0, total_frames, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if not ret:
-                continue
+
+# ── caption ──────────────────────────────────────────────────────
+def run_caption(cfg):
+    sec("Auto Caption")
+    from transformers import (BlipProcessor, BlipForConditionalGeneration,
+                              AutoImageProcessor, SiglipForImageClassification)
+
+    folder = cfg["data_dir"]
+    bsz    = int(cfg.get("caption_batch", 4))
+    bid    = cfg.get("blip_model",  "Salesforce/blip-image-captioning-base")
+    sid    = cfg.get("style_model", "strangerguardhf/nsfw_image_detection")
+
+    if not os.path.isdir(folder):
+        print("  " + clr("folder not found: " + folder, R)); return
+
+    old = list(Path(folder).glob("*.txt"))
+    for f in old:
+        try: f.unlink()
+        except: pass
+    if old: print("  " + clr("cleared " + str(len(old)) + " old captions", G))
+
+    print("  " + clr("loading BLIP...", C))
+    dt  = torch.float16 if torch.cuda.is_available() else torch.float32
+    bp  = BlipProcessor.from_pretrained(bid)
+    bm  = BlipForConditionalGeneration.from_pretrained(bid, torch_dtype=dt).to(device)
+    print("  " + clr("loading style classifier...", C))
+    sp  = AutoImageProcessor.from_pretrained(sid)
+    sm  = SiglipForImageClassification.from_pretrained(sid).to(device)
+    bm.eval(); sm.eval()
+    print("  " + clr("loaded on " + ("GPU" if device=="cuda" else "CPU"), G) + "\n")
+
+    SL = {"0":"Anime","1":"Explicit","2":"Normal","3":"Explicit Photo","4":"Suggestive"}
+
+    def get_styles(paths):
+        inp = sp(images=[Image.open(p).convert("RGB") for p in paths], return_tensors="pt").to(device)
+        with torch.no_grad(): logits = sm(**inp).logits
+        return [SL.get(str(i),"Unknown") for i in torch.softmax(logits,1).argmax(1).tolist()]
+
+    def get_captions(paths):
+        inp = bp(images=[Image.open(p).convert("RGB") for p in paths], return_tensors="pt").to(device)
+        with torch.no_grad(): out = bm.generate(**inp, max_new_tokens=120, min_length=20, do_sample=False)
+        return [bp.decode(o, skip_special_tokens=True).strip() for o in out]
+
+    media = sorted([p for p in Path(folder).iterdir()
+                    if p.suffix.lower() in {".png",".jpg",".jpeg",".webp",".gif"}])
+    if not media: print("  " + clr("no images found", Y)); return
+
+    print("  " + clr("captioning " + str(len(media)) + " images, batch " + str(bsz) + "...", C) + "\n")
+    ok = fail = 0; t0 = time.time()
+
+    for i in tqdm(range(0, len(media), bsz), desc="  batches", unit="batch",
+                  dynamic_ncols=True, colour="cyan"):
+        batch = media[i:i+bsz]
+        try:   sl = get_styles(batch); cl_ = get_captions(batch)
+        except Exception as ex:
+            print("  " + clr("batch error: " + str(ex), Y))
+            sl = ["Unknown"] * len(batch); cl_ = [""] * len(batch)
+        for path, s, cap in zip(batch, sl, cl_):
+            if cap:
+                path.with_suffix(".txt").write_text("Style: " + s + "\nCaption: " + cap, encoding="utf-8")
+                ok += 1
+            else: fail += 1
+
+    elapsed = time.time() - t0
+    print("\n  " + clr("done.  " + str(ok) + " captioned  " + str(fail) + " failed"
+                        "  avg " + str(round(elapsed/max(len(media),1),2)) + "s each", G) + "\n")
+
+
+# ── image edit (terminal) ─────────────────────────────────────────
+# face swap, face restore, img2img, filters - all in terminal
+# no browser, everything interactive in the console
+
+def terminal_image_editor(cfg=None):
+    """
+    Pure terminal image editing suite.
+    Face swap / restore / img2img / filters.
+    Ctrl+U uploads a new image at any prompt.
+    """
+    import msvcrt  # will fail on linux - we handle that
+    _msvcrt = True
+    try:    import msvcrt
+    except: _msvcrt = False
+
+    mid = (cfg or {}).get("model_id", "")
+
+    def pick_image(label="input image"):
+        sec("Pick Image  (or press Ctrl+U to type a path)")
+        print("  " + clr("Ctrl+U = upload/type a path,  or type it directly", DIM) + "\n")
+        while True:
+            raw = input("  " + clr(label, C) + ": ").strip().strip('"').strip("'")
+            if not raw: print("  " + clr("path required", R)); continue
+            if not os.path.exists(raw): print("  " + clr("file not found: " + raw, R)); continue
             try:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(frame))
-            except Exception:
-                continue
-            if len(frames) >= MAX_FRAMES_PER_VIDEO:
-                break
-        cap.release()
-        return frames
+                img = Image.open(raw).convert("RGB")
+                print("  " + clr("loaded: " + str(img.size[0]) + "x" + str(img.size[1]), G))
+                return raw, img
+            except Exception as ex:
+                print("  " + clr("cannot open: " + str(ex), R))
 
-    def _prepare_latents(self, vae):
-        total_items = len(self.image_paths) + len(self.video_paths)
-        if os.path.exists(self.cache_file) and os.path.exists(self.meta_file):
-            with open(self.meta_file) as f:
-                meta = json.load(f)
-            if meta.get("count") == total_items:
-                print(f"  {clr('✓', G)} Loaded cached latents — skipping VAE encode")
-                return torch.load(self.cache_file)
+    def save_result(img, src_path, suffix):
+        p    = Path(src_path)
+        out  = p.parent / (p.stem + "_" + suffix + p.suffix)
+        img.save(str(out))
+        print("  " + clr("saved -> " + str(out), G))
+        return str(out)
 
-        print(f"  {clr('→', C)} Encoding VAE latents...")
-        print(
-    f" {clr('ℹ', C)} "
-    f"{clr('Don’t worry if it looks stuck, speed depends on your GPU’s VRAM', DIM)}\n")
-        vae.eval()
-        data = []
+    while True:
+        sec("Image Editor")
+        print("  " + clr("1", C) + "  face swap           replace a face with another")
+        print("  " + clr("2", C) + "  face restore         fix blurry / broken faces")
+        print("  " + clr("3", C) + "  img2img              re-draw an image with a prompt")
+        print("  " + clr("4", C) + "  basic filters        brightness, contrast, sharpen, blur")
+        print("  " + clr("5", C) + "  batch face restore   run restoration on a whole folder")
+        print("  " + clr("6", C) + "  resize single        resize one image to exact dimensions")
+        print("  " + clr("0", C) + "  back to main menu")
+        print()
+        ch = input("  " + clr(">", C) + " ").strip()
 
-        for path in tqdm(self.image_paths, desc="  Images", unit="img",
-                         dynamic_ncols=True, colour="cyan"):
+        if ch == "0": break
+
+        elif ch == "1":
+            # face swap using insightface + inswapper
+            sec("Face Swap")
+            print("  " + clr("needs insightface + onnxruntime installed", DIM))
+            print("  " + clr("source = the face you want to USE", DIM))
+            print("  " + clr("target = the image you want to edit", DIM) + "\n")
             try:
-                img    = Image.open(path).convert("RGB")
-                tensor = self.transform(img).unsqueeze(0).to(device, non_blocking=True)
-                with torch.no_grad():
-                    latent = vae.encode(tensor).latent_dist.sample() * 0.18215
-                data.append({
-                    "latent": latent.squeeze(0).cpu(),
-                    "caption": self.captions.get(
-                        os.path.splitext(os.path.basename(path))[0],
-                        os.path.basename(path)
-                    )
-                })
-            except Exception:
-                print(f"  {clr('!', Y)} Skipping corrupted image: {path}")
-                continue
-
-        if CV2_AVAILABLE and self.video_paths:
-            for path in tqdm(self.video_paths, desc="  Videos", unit="vid",
-                             dynamic_ncols=True, colour="cyan"):
+                import insightface
+                from insightface.app import FaceAnalysis
+            except ImportError:
+                print("  " + clr("insightface not installed. running pip install...", Y))
+                ok = pip_install("insightface", ["insightface"])
+                if not ok:
+                    print("  " + clr("trying pre-built wheel for Windows...", Y))
+                    wheel = "https://github.com/Gourieff/Assets/raw/main/insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl"
+                    pip_install("insightface-wheel", [wheel])
                 try:
-                    frames = self.extract_frames(path)
-                    if not frames:
-                        print(f"  {clr('!', Y)} Skipping corrupted video: {path}")
-                        continue
-                    base_name = os.path.splitext(os.path.basename(path))[0]
-                    caption   = self.captions.get(base_name, base_name)
-                    for idx, frame in enumerate(frames):
-                        try:
-                            tensor = self.transform(frame).unsqueeze(0).to(device, non_blocking=True)
-                            with torch.no_grad():
-                                latent = vae.encode(tensor).latent_dist.sample() * 0.18215
-                            data.append({
-                                "latent": latent.squeeze(0).cpu(),
-                                "caption": f"{caption}, frame {idx}"
-                            })
-                        except Exception:
-                            continue
-                except Exception:
-                    print(f"  {clr('!', Y)} Skipping corrupted video: {path}")
-                    continue
+                    import insightface
+                    from insightface.app import FaceAnalysis
+                except ImportError:
+                    print("  " + clr("insightface still not available.", R))
+                    print("  " + clr("install Visual C++ Build Tools from:", Y))
+                    print("  " + clr("  visualstudio.microsoft.com/visual-cpp-build-tools", W))
+                    pause(); continue
 
-        torch.save(data, self.cache_file)
-        with open(self.meta_file, "w") as f:
-            json.dump({"count": total_items}, f)
+            src_path, src_img = pick_image("source face image (the face to use)")
+            dst_path, dst_img = pick_image("target image (image to edit)")
+
+            try:
+                import numpy as np
+                print("  " + clr("loading face analyser...", C))
+                fa = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+                fa.prepare(ctx_id=0, det_size=(640,640))
+
+                src_arr = np.array(src_img)[:,:,::-1].copy()
+                dst_arr = np.array(dst_img)[:,:,::-1].copy()
+
+                src_faces = fa.get(src_arr)
+                dst_faces = fa.get(dst_arr)
+
+                if not src_faces:
+                    print("  " + clr("no face found in source image", R)); pause(); continue
+                if not dst_faces:
+                    print("  " + clr("no face found in target image", R)); pause(); continue
+
+                print("  " + clr("source faces: " + str(len(src_faces)), G))
+                print("  " + clr("target faces: " + str(len(dst_faces)), G))
+
+                # look for inswapper model
+                swapper_paths = glob.glob(os.path.join(os.path.expanduser("~"), "**", "inswapper_128.onnx"), recursive=True)
+                if not swapper_paths:
+                    print("\n  " + clr("inswapper_128.onnx not found", Y))
+                    print("  " + clr("download it from huggingface.co/deepinsight/insightface", Y))
+                    mp = input("  " + clr("paste path to inswapper_128.onnx: ", C)).strip().strip('"').strip("'")
+                    if not os.path.exists(mp):
+                        print("  " + clr("file not found", R)); pause(); continue
+                    swapper_paths = [mp]
+
+                import onnxruntime
+                swapper = insightface.model_zoo.get_model(swapper_paths[0],
+                              providers=["CUDAExecutionProvider","CPUExecutionProvider"])
+                swapper.prepare(ctx_id=0)
+
+                result = dst_arr.copy()
+                for df in dst_faces:
+                    result = swapper.get(result, df, src_faces[0], paste_back=True)
+
+                out_img = Image.fromarray(result[:,:,::-1])
+                save_result(out_img, dst_path, "faceswap")
+                print("  " + clr("face swap done", G))
+            except Exception as ex:
+                print("  " + clr("face swap failed: " + str(ex), R))
+            pause()
+
+        elif ch == "2":
+            # face restore using GFPGAN or CodeFormer
+            sec("Face Restore")
+            print("  " + clr("tries GFPGAN first, falls back to PIL sharpening if not installed", DIM) + "\n")
+            dst_path, dst_img = pick_image("image to restore faces in")
+            try:
+                try:
+                    from gfpgan import GFPGANer
+                    import numpy as np
+                    print("  " + clr("GFPGAN found, using it", G))
+                    restorer = GFPGANer(model_path=None, upscale=1,
+                                        arch="clean", channel_multiplier=2)
+                    _, _, output = restorer.enhance(
+                        np.array(dst_img)[:,:,::-1], has_aligned=False,
+                        only_center_face=False, paste_back=True
+                    )
+                    out_img = Image.fromarray(output[:,:,::-1])
+                except ImportError:
+                    print("  " + clr("GFPGAN not installed, using PIL sharpen instead", Y))
+                    print("  " + clr("install gfpgan for better results: pip install gfpgan", DIM))
+                    # basic PIL face-area sharpen
+                    out_img = dst_img.filter(ImageFilter.SHARPEN)
+                    out_img = ImageEnhance.Sharpness(out_img).enhance(2.0)
+                    out_img = ImageEnhance.Contrast(out_img).enhance(1.1)
+                save_result(out_img, dst_path, "restored")
+                print("  " + clr("restore done", G))
+            except Exception as ex:
+                print("  " + clr("restore failed: " + str(ex), R))
+            pause()
+
+        elif ch == "3":
+            # img2img in terminal
+            sec("img2img  |  Re-draw with a Prompt")
+            if not mid:
+                mid, _ = _pick_model_search()
+            dst_path, dst_img = pick_image("base image")
+            print()
+            prompt = ""
+            while not prompt:
+                prompt = input("  " + clr("prompt", C) + ": ").strip()
+                if not prompt: print("  " + clr("required", R))
+            neg    = input("  " + clr("negative prompt (enter to skip)", C) + ": ").strip()
+            strength = _ask("strength 0.0-1.0 (higher = more change)", 0.6, float)
+            steps    = _ask("steps", 30, int)
+            cfg_s    = _ask("guidance", 7.5, float)
+            try:
+                print("  " + clr("loading pipeline...", C))
+                pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    mid, torch_dtype=torch.float16, safety_checker=None
+                ).to(device)
+                res_w, res_h = dst_img.size
+                # keep aspect ratio, round to 64
+                max_s = 768
+                scale = min(max_s/res_w, max_s/res_h)
+                nw    = int(res_w * scale / 64) * 64
+                nh    = int(res_h * scale / 64) * 64
+                init  = dst_img.resize((nw, nh), Image.LANCZOS)
+                print("  " + clr("generating...", C))
+                result = pipe(
+                    prompt=prompt,
+                    negative_prompt=neg or None,
+                    image=init,
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg_s,
+                ).images[0]
+                save_result(result, dst_path, "img2img")
+                print("  " + clr("done", G))
+            except torch.cuda.OutOfMemoryError:
+                print("  " + clr("out of VRAM, try lower steps or smaller image", R))
+            except Exception as ex:
+                print("  " + clr("img2img failed: " + str(ex), R))
+            pause()
+
+        elif ch == "4":
+            # basic PIL filters
+            sec("Basic Filters")
+            dst_path, dst_img = pick_image("image to edit")
+            print()
+            print("  " + clr("a", C) + "  brightness    b  contrast    c  sharpen    d  blur")
+            print("  " + clr("e", C) + "  saturate      f  greyscale   g  flip H     h  flip V")
+            print()
+            ops = input("  " + clr("pick letters (e.g. abc or just a): ", C)).strip().lower()
+            out = dst_img.copy()
+            applied = []
+            for op in ops:
+                if op == "a":
+                    v = _ask("brightness factor (1.0 = no change, 1.5 = brighter)", 1.3, float)
+                    out = ImageEnhance.Brightness(out).enhance(v); applied.append("brightness")
+                elif op == "b":
+                    v = _ask("contrast factor", 1.3, float)
+                    out = ImageEnhance.Contrast(out).enhance(v); applied.append("contrast")
+                elif op == "c":
+                    v = _ask("sharpness factor", 2.0, float)
+                    out = ImageEnhance.Sharpness(out).enhance(v); applied.append("sharpen")
+                elif op == "d":
+                    r = _ask("blur radius pixels", 2, int)
+                    out = out.filter(ImageFilter.GaussianBlur(radius=r)); applied.append("blur")
+                elif op == "e":
+                    v = _ask("saturation factor", 1.4, float)
+                    out = ImageEnhance.Color(out).enhance(v); applied.append("saturate")
+                elif op == "f":
+                    out = out.convert("L").convert("RGB"); applied.append("greyscale")
+                elif op == "g":
+                    out = out.transpose(Image.FLIP_LEFT_RIGHT); applied.append("flipH")
+                elif op == "h":
+                    out = out.transpose(Image.FLIP_TOP_BOTTOM); applied.append("flipV")
+            if applied:
+                suf = "_".join(applied)
+                save_result(out, dst_path, suf)
+                print("  " + clr("applied: " + ", ".join(applied), G))
+            else:
+                print("  " + clr("nothing selected", Y))
+            pause()
+
+        elif ch == "5":
+            # batch face restore
+            sec("Batch Face Restore")
+            folder = _pick_data_dir()
+            imgs   = sum([glob.glob(os.path.join(folder,"*."+e)) for e in IEXT], [])
+            if not imgs: print("  " + clr("no images found", R)); pause(); continue
+            print("  " + clr(str(len(imgs)) + " images found", G))
+            input("  " + clr("enter to start...", Y))
+            ok = fail = 0
+            try:
+                from gfpgan import GFPGANer
+                import numpy as np
+                restorer = GFPGANer(model_path=None, upscale=1, arch="clean", channel_multiplier=2)
+                use_gfpgan = True
+            except ImportError:
+                print("  " + clr("GFPGAN not installed, using PIL sharpening", Y))
+                use_gfpgan = False
+            for p in tqdm(imgs, desc="  restoring", unit="img", dynamic_ncols=True, colour="cyan"):
+                try:
+                    img = Image.open(p).convert("RGB")
+                    if use_gfpgan:
+                        import numpy as np
+                        _, _, out = restorer.enhance(
+                            np.array(img)[:,:,::-1], has_aligned=False,
+                            only_center_face=False, paste_back=True
+                        )
+                        res = Image.fromarray(out[:,:,::-1])
+                    else:
+                        res = ImageEnhance.Sharpness(img).enhance(2.0)
+                    res.save(p)
+                    ok += 1
+                except Exception: fail += 1
+            print("  " + clr("done.  " + str(ok) + " ok  " + str(fail) + " failed", G))
+            pause()
+
+        elif ch == "6":
+            # resize single image
+            sec("Resize Single Image")
+            src_path, src_img = pick_image("image to resize")
+            w = _ask("width", 512, int)
+            h = _ask("height", 512, int)
+            try:
+                out = src_img.resize((w, h), Image.LANCZOS)
+                save_result(out, src_path, str(w) + "x" + str(h))
+                print("  " + clr("done", G))
+            except Exception as ex:
+                print("  " + clr("resize failed: " + str(ex), R))
+            pause()
+
+
+# ── datasets ──────────────────────────────────────────────────────
+class LatentCacheDataset(Dataset):
+    def __init__(self, folder, tok, vae, res, ckd):
+        self.tok       = tok
+        self.cache     = os.path.join(ckd, "latent_cache.pt")
+        self.meta      = os.path.join(ckd, "latent_meta.json")
+        self.transform = transforms.Compose([
+            transforms.Resize(res), transforms.CenterCrop(res),
+            transforms.ToTensor(), transforms.Normalize([.5]*3,[.5]*3),
+        ])
+        self.imgs = sum([glob.glob(os.path.join(folder,"*."+e)) for e in IEXT], [])
+        self.vids = sum([glob.glob(os.path.join(folder,"*."+e)) for e in VEXT], []) if CV2 else []
+        self.caps = {}
+        for tf in glob.glob(os.path.join(folder,"*.txt")):
+            nm = os.path.splitext(os.path.basename(tf))[0]
+            try:
+                with open(tf,"r",encoding="utf-8") as fh: self.caps[nm] = fh.read().strip()
+            except: pass
+        self.data = self._build(vae)
+
+    def _frames(self, path):
+        frames = []; cap = cv2.VideoCapture(path)
+        if not cap.isOpened(): return frames
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0: cap.release(); return frames
+        step = max(1, total // MAX_VFRAMES)
+        for i in range(0, total, step):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ret, fr = cap.read()
+            if not ret: continue
+            try: frames.append(Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
+            except: continue
+            if len(frames) >= MAX_VFRAMES: break
+        cap.release(); return frames
+
+    def _build(self, vae):
+        total = len(self.imgs) + len(self.vids)
+        if os.path.exists(self.cache) and os.path.exists(self.meta):
+            with open(self.meta) as fh:
+                if json.load(fh).get("n") == total:
+                    print("  " + clr("latent cache found, skipping re-encode", G))
+                    return torch.load(self.cache)
+        print("  " + clr("encoding through VAE... first run can look frozen, it isn't", C) + "\n")
+        vae.eval(); data = []
+        for path in tqdm(self.imgs, desc="  images", unit="img", dynamic_ncols=True, colour="cyan"):
+            try:
+                t = self.transform(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
+                with torch.no_grad(): lat = vae.encode(t).latent_dist.sample() * 0.18215
+                cap = self.caps.get(os.path.splitext(os.path.basename(path))[0], os.path.basename(path))
+                data.append({"lat": lat.squeeze(0).cpu(), "cap": cap})
+            except: print("  " + clr("skipping: " + path, Y))
+        if CV2 and self.vids:
+            for path in tqdm(self.vids, desc="  videos", unit="vid", dynamic_ncols=True, colour="cyan"):
+                try:
+                    frames = self._frames(path)
+                    if not frames: continue
+                    base = os.path.splitext(os.path.basename(path))[0]
+                    cap  = self.caps.get(base, base)
+                    for idx, fr in enumerate(frames):
+                        t = self.transform(fr).unsqueeze(0).to(device)
+                        with torch.no_grad(): lat = vae.encode(t).latent_dist.sample() * 0.18215
+                        data.append({"lat": lat.squeeze(0).cpu(), "cap": cap + " frame " + str(idx)})
+                except: print("  " + clr("skipping video: " + path, Y))
+        torch.save(data, self.cache)
+        with open(self.meta,"w") as fh: json.dump({"n": total}, fh)
         return data
 
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        item   = self.data[idx]
-        tokens = self.tokenizer(
-            item["caption"], padding="max_length", truncation=True,
-            max_length=77, return_tensors="pt"
-        )
-        return {
-            "latent":         item["latent"],
-            "input_ids":      tokens.input_ids.squeeze(0),
-            "attention_mask": tokens.attention_mask.squeeze(0)
-        }
+    def __len__(self): return len(self.data)
+    def __getitem__(self, i):
+        item = self.data[i]
+        tok  = self.tok(item["cap"], padding="max_length", truncation=True, max_length=77, return_tensors="pt")
+        return {"lat": item["lat"], "ids": tok.input_ids.squeeze(0), "mask": tok.attention_mask.squeeze(0)}
 
 
 class ImageCaptionDataset(Dataset):
-    def __init__(self, folder, tokenizer, resolution):
-        self.paths = []
-        for ext in ["png", "jpg", "jpeg", "webp", "bmp", "tiff"]:
-            self.paths += glob.glob(os.path.join(folder, f"*.{ext}"))
-        self.tokenizer = tokenizer
-        self.transform = transforms.Compose([
-            transforms.Resize(resolution),
-            transforms.CenterCrop(resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),
+    def __init__(self, folder, tok, res):
+        self.paths = sum([glob.glob(os.path.join(folder,"*."+e)) for e in IEXT], [])
+        self.tok   = tok
+        self.xform = transforms.Compose([
+            transforms.Resize(res), transforms.CenterCrop(res),
+            transforms.ToTensor(), transforms.Normalize([.5]*3,[.5]*3),
         ])
-        print(f"  {clr('✓', G)} Loaded {clr(str(len(self.paths)), W)} images")
+        print("  " + clr("loaded " + str(len(self.paths)) + " images", G))
 
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        path = self.paths[idx]
-        try:
-            image = Image.open(path).convert("RGB")
-        except Exception:
-            return self.__getitem__((idx + 1) % len(self.paths))
-        image   = self.transform(image)
-        caption = os.path.splitext(os.path.basename(path))[0]
-        txt     = os.path.splitext(path)[0] + ".txt"
+    def __len__(self): return len(self.paths)
+    def __getitem__(self, i):
+        path = self.paths[i]
+        try: img = Image.open(path).convert("RGB")
+        except: return self.__getitem__((i+1) % len(self.paths))
+        img  = self.xform(img)
+        cap  = os.path.splitext(os.path.basename(path))[0]
+        txt  = os.path.splitext(path)[0] + ".txt"
         if os.path.exists(txt):
             try:
-                with open(txt, encoding="utf-8") as f:
-                    caption = f.read().strip()
-            except Exception:
-                pass
-        tokens = self.tokenizer(
-            caption, padding="max_length", max_length=77,
-            truncation=True, return_tensors="pt"
-        )
-        return image, tokens.input_ids[0]
+                with open(txt, encoding="utf-8") as fh: cap = fh.read().strip()
+            except: pass
+        tok = self.tok(cap, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
+        return img, tok.input_ids[0]
 
 
-def find_latest_checkpoint(folder):
+# ── checkpoint helpers ────────────────────────────────────────────
+def find_latest(folder):
     hits = []
-    for pattern in ["step_*.pt", "step_*.safetensors"]:
-        for c in glob.glob(os.path.join(folder, pattern)):
-            m = re.search(r"step_(\d+)\.(pt|safetensors)$", os.path.basename(c))
-            if m:
-                hits.append((c, int(m.group(1))))
-    if not hits:
-        return None, 0
-    hits.sort(key=lambda x: x[1])
-    return hits[-1]
+    for pat in ["step_*.pt","step_*.safetensors"]:
+        for f in glob.glob(os.path.join(folder, pat)):
+            m = re.search(r"step_(\d+)\.(pt|safetensors)$", os.path.basename(f))
+            if m: hits.append((f, int(m.group(1))))
+    if not hits: return None, 0
+    return sorted(hits, key=lambda x: x[1])[-1]
 
+def all_weights(folder):
+    out = []
+    for pat in ["*.pt","*.safetensors"]:
+        out += glob.glob(os.path.join(folder, pat))
+    return sorted(out)
 
-def find_all_weights(folder):
-    found = []
-    for f in (glob.glob(os.path.join(folder, "*.pt")) +
-              glob.glob(os.path.join(folder, "*.safetensors"))):
-        found.append(f)
-    return sorted(found)
+def load_into(model, path):
+    ext   = Path(path).suffix.lower()
+    state = load_file(path) if ext == ".safetensors" else torch.load(path, map_location="cpu", weights_only=True)
+    res   = model.load_state_dict(state, strict=False)
+    n     = len(state) - len(res.missing_keys)
+    print("  " + clr("loaded " + str(n) + "/" + str(len(state)) + " tensors from " + Path(path).name, G))
 
-
-def load_weights_into_unet(unet, path):
-    ext    = Path(path).suffix.lower()
-    state  = load_file(path) if ext == ".safetensors" else torch.load(path, map_location="cpu", weights_only=True)
-    result = unet.load_state_dict(state, strict=False)
-    loaded = len(state) - len(result.missing_keys)
-    print(f"  {clr('✓', G)} Loaded {loaded}/{len(state)} tensors from {clr(Path(path).name, W)}")
-
-
-def save_checkpoint_st(unet, text_encoder, folder, step):
+def save_st(unet, te, folder, step):
     os.makedirs(folder, exist_ok=True)
-    lora_state = {k: v for k, v in unet.state_dict().items() if "lora_" in k}
-    lora_state.update({k: v for k, v in text_encoder.state_dict().items() if "lora_" in k})
-    save_file(lora_state, os.path.join(folder, f"step_{step}.safetensors"))
-    print(f"  {clr('💾', Y)} Saved step_{step}.safetensors")
+    st = {k:v for k,v in unet.state_dict().items() if "lora_" in k}
+    st.update({k:v for k,v in te.state_dict().items() if "lora_" in k})
+    save_file(st, os.path.join(folder, "step_" + str(step) + ".safetensors"))
+    print("  " + clr("checkpoint saved at step " + str(step), Y))
 
-
-def save_checkpoint_pt(unet, folder, step):
+def save_pt(unet, folder, step):
     os.makedirs(folder, exist_ok=True)
-    pt_path    = os.path.join(folder, f"step_{step}.pt")
-    st_path    = os.path.join(folder, f"step_{step}.safetensors")
-    state      = unet.state_dict()
-    torch.save(state, pt_path)
-    lora_state = {k: v for k, v in state.items() if "lora_" in k}
-    if lora_state:
-        save_file(lora_state, st_path)
-    print(f"  {clr('💾', Y)} Saved step_{step}.pt + step_{step}.safetensors")
+    st = unet.state_dict()
+    torch.save(st, os.path.join(folder, "step_" + str(step) + ".pt"))
+    lo = {k:v for k,v in st.items() if "lora_" in k}
+    if lo: save_file(lo, os.path.join(folder, "step_" + str(step) + ".safetensors"))
+    print("  " + clr("checkpoint saved at step " + str(step), Y))
 
 
+# ── validated ask (caps settings that would break the model) ──────
+def _validated_ask(label, default, cast, prof, field):
+    """
+    Ask for a value but warn and cap if it would break the chosen model.
+    For fine tune we enforce the model's native resolution minimum.
+    Standard train can go lower since it's not bound the same way.
+    """
+    while True:
+        raw = input("  " + clr(label, C) + " [" + clr(str(default), W) + "]: ").strip()
+        if not raw: return default
+        try: val = cast(raw)
+        except: print("  " + clr("not a valid number", R)); continue
+
+        if field == "res" and prof:
+            mn = prof.get("min_res", 512)
+            if val < mn:
+                print("  " + clr("WARNING: this model needs at least " + str(mn) + "px", R))
+                print("  " + clr("  going below " + str(mn) + "px will break generation", Y))
+                c = input("  " + clr("  use minimum " + str(mn) + " instead? y/n [y]: ", C)).strip().lower()
+                if c != "n":
+                    print("  " + clr("  capped to " + str(mn), G))
+                    return mn
+                print("  " + clr("  keeping " + str(val) + "px  (expect broken outputs)", Y))
+                return val
+
+        if field == "rank" and prof:
+            mn = prof.get("min_rank", 4)
+            if val < mn:
+                print("  " + clr("WARNING: rank below " + str(mn) + " will likely fail", R))
+                c = input("  " + clr("  use minimum " + str(mn) + " instead? y/n [y]: ", C)).strip().lower()
+                if c != "n": return mn
+                return val
+
+        if field == "te_rank" and prof and prof.get("flux"):
+            if val < 16:
+                print("  " + clr("WARNING: Flux text encoder rank below 16 breaks generation", R))
+                print("  " + clr("  the encoder is tightly coupled with the diffusion model here", Y))
+                c = input("  " + clr("  use 16 instead? y/n [y]: ", C)).strip().lower()
+                if c != "n": return 16
+                return val
+
+        return val
+
+
+def _ask(label, default, cast=str):
+    raw = input("  " + clr(label, C) + " [" + clr(str(default), W) + "]: ").strip()
+    if not raw: return default
+    try: return cast(raw)
+    except: return default
+
+# ── fine tune ─────────────────────────────────────────────────────
 def run_finetune(cfg):
-    section("Loading Models  [Fine-Tune Mode]")
+    sec("Fine Tune  |  Dual LoRA + VAE Cache")
+    dd   = cfg["data_dir"];          ckd  = cfg["checkpoint_dir"]
+    mid  = cfg["model_id"];          ms   = int(cfg["max_steps"])
+    sv   = int(cfg["save_every"]);   bs   = int(cfg["batch_size"])
+    ga   = int(cfg["grad_accum"]);   res  = int(cfg["resolution"])
+    ulr  = float(cfg["unet_lr"]);    tlr  = float(cfg["text_lr"])
+    ur   = int(cfg["unet_rank"]);    ua   = int(cfg["unet_alpha"])
+    tr   = int(cfg["te_rank"]);      ta   = int(cfg["te_alpha"])
+    drop = float(cfg["dropout"]);    nw   = int(cfg.get("num_workers",4))
+    gc   = bool(cfg.get("gradient_checkpointing", True))
+    elo  = cfg.get("existing_lora")
+    prof = cfg.get("_profile", _DEFAULT)
 
-    data_dir       = cfg["data_dir"]
-    checkpoint_dir = cfg["checkpoint_dir"]
-    model_id       = cfg["model_id"]
-    max_steps      = int(cfg["max_steps"])
-    save_every     = int(cfg["save_every"])
-    batch_size     = int(cfg["batch_size"])
-    grad_accum     = int(cfg["grad_accum"])
-    resolution     = int(cfg["resolution"])
-    unet_lr        = float(cfg["unet_lr"])
-    text_lr        = float(cfg["text_lr"])
-    unet_rank      = int(cfg["unet_rank"])
-    unet_alpha     = int(cfg["unet_alpha"])
-    te_rank        = int(cfg["te_rank"])
-    te_alpha       = int(cfg["te_alpha"])
-    dropout        = float(cfg["dropout"])
-    grad_ckpt      = bool(cfg.get("gradient_checkpointing", True))
-    existing_lora  = cfg.get("existing_lora")
+    UT = ["to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2"]
+    TT = ["q_proj","k_proj","v_proj","out_proj","fc1","fc2"]
+    os.makedirs(ckd, exist_ok=True)
 
-    unet_targets = ["to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"]
-    te_targets   = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+    print("  " + clr("model   ", DIM) + mid)
+    print("  " + clr("type    ", DIM) + prof["label"])
+    print("  " + clr("data    ", DIM) + dd)
+    print("  " + clr("output  ", DIM) + ckd)
+    if elo: print("  " + clr("base LoRA", DIM) + elo)
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    print("  " + clr("\nloading model components...", C))
+    try:
+        tok  = CLIPTokenizer.from_pretrained(mid, subfolder="tokenizer")
+        te   = CLIPTextModel.from_pretrained(mid, subfolder="text_encoder").to(device)
+        vae  = AutoencoderKL.from_pretrained(mid, subfolder="vae").to(device)
+        unet = UNet2DConditionModel.from_pretrained(mid, subfolder="unet").to(device)
+        sch  = DDPMScheduler.from_pretrained(mid, subfolder="scheduler")
+    except Exception as ex:
+        print("  " + clr("failed to load model: " + str(ex), R))
+        print("  " + clr("check internet and model ID", Y))
+        pause(); return
 
-    print(f"  {clr('Base model', DIM)} {model_id}")
-    print(f"  {clr('Data dir  ', DIM)} {data_dir}")
-    print(f"  {clr('Output    ', DIM)} {checkpoint_dir}")
+    for p in vae.parameters():  p.requires_grad = False
+    for p in unet.parameters(): p.requires_grad = False
+    for p in te.parameters():   p.requires_grad = False
 
-    tokenizer    = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
-    vae          = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
-    unet         = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
-    scheduler    = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    try:
+        unet = get_peft_model(unet, LoraConfig(r=ur, lora_alpha=ua, target_modules=UT, lora_dropout=drop, bias="none"))
+        te   = get_peft_model(te,   LoraConfig(r=tr, lora_alpha=ta, target_modules=TT, lora_dropout=drop, bias="none"))
+    except Exception as ex:
+        print("  " + clr("LoRA setup failed: " + str(ex), R)); pause(); return
 
-    for p in vae.parameters():          p.requires_grad = False
-    for p in unet.parameters():         p.requires_grad = False
-    for p in text_encoder.parameters(): p.requires_grad = False
+    if elo and os.path.exists(elo):
+        print("  " + clr("loading base LoRA weights...", C))
+        try:
+            st = load_file(elo)
+            unet.load_state_dict(st, strict=False)
+            te.load_state_dict(st, strict=False)
+            print("  " + clr("loaded", G))
+        except Exception as ex:
+            print("  " + clr("could not load LoRA: " + str(ex) + "  starting fresh", Y))
 
-    unet = get_peft_model(unet, LoraConfig(
-        r=unet_rank, lora_alpha=unet_alpha,
-        target_modules=unet_targets,
-        lora_dropout=dropout, bias="none"
-    ))
-    text_encoder = get_peft_model(text_encoder, LoraConfig(
-        r=te_rank, lora_alpha=te_alpha,
-        target_modules=te_targets,
-        lora_dropout=dropout, bias="none"
-    ))
+    trainable = (sum(p.numel() for p in unet.parameters() if p.requires_grad)
+               + sum(p.numel() for p in te.parameters()   if p.requires_grad))
+    print("  " + clr("trainable params: " + "{:,}".format(trainable), G))
 
-    if existing_lora and os.path.exists(existing_lora):
-        print(f"  {clr('→', C)} Loading existing LoRA weights...")
-        state = load_file(existing_lora)
-        unet.load_state_dict(state, strict=False)
-        text_encoder.load_state_dict(state, strict=False)
-
-    trainable = (
-        sum(p.numel() for p in unet.parameters() if p.requires_grad) +
-        sum(p.numel() for p in text_encoder.parameters() if p.requires_grad)
-    )
-    print(f"  {clr('✓', G)} Trainable LoRA params: {clr(f'{trainable:,}', W)}")
-
-    if grad_ckpt:
+    if gc:
         unet.enable_gradient_checkpointing()
-        text_encoder.gradient_checkpointing_enable()
+        te.gradient_checkpointing_enable()
+        print("  " + clr("gradient checkpointing on", DIM))
 
-    optimizer = torch.optim.AdamW(
-        list(unet.parameters()) + list(text_encoder.parameters()),
-        lr=unet_lr, betas=(0.9, 0.99), weight_decay=0.01
-    )
+    opt = AdamW(list(unet.parameters()) + list(te.parameters()),
+                lr=ulr, betas=(.9,.99), weight_decay=.01)
 
-    section("Loading Dataset")
-    print(f" {clr('ℹ', C)} {clr('Don’t worry if it looks stuck, speed depends on your GPU’s VRAM', DIM)}\n")
-    dataset    = LatentCacheDataset(data_dir, tokenizer, vae, resolution, checkpoint_dir)
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, persistent_workers=True
-    )
+    sec("Loading Dataset")
+    try:
+        ds = LatentCacheDataset(dd, tok, vae, res, ckd)
+        dl = DataLoader(ds, batch_size=bs, shuffle=True, num_workers=nw,
+                        pin_memory=True, persistent_workers=(nw>0))
+    except Exception as ex:
+        print("  " + clr("dataset error: " + str(ex), R)); pause(); return
 
-    scaler      = torch.cuda.amp.GradScaler()
-    global_step = 0
+    if len(ds) == 0:
+        print("  " + clr("no images found in " + dd, R)); pause(); return
 
-    section("Training")
-    print(f"  {clr('Steps', DIM)} 0 → {max_steps}  ({clr(str(max_steps), W)} total)\n")
+    scaler = torch.cuda.amp.GradScaler()
+    gs     = 0
 
-    pbar       = tqdm(total=max_steps, desc="  Fine-Tune", unit="step",
-                      dynamic_ncols=True, colour="cyan")
-    start_time = time.time()
+    sec("Training")
+    print("  " + clr("running for " + str(ms) + " steps\n", DIM))
+    bar = tqdm(total=ms, desc="  finetune", unit="step", dynamic_ncols=True, colour="cyan")
+    t0  = time.time()
 
-    while global_step < max_steps:
-        for batch in dataloader:
-            latents   = batch["latent"].to(device, non_blocking=True)
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attn_mask = batch["attention_mask"].to(device, non_blocking=True)
+    try:
+        while gs < ms:
+            for batch in dl:
+                lats = batch["lat"].to(device, non_blocking=True)
+                ids  = batch["ids"].to(device, non_blocking=True)
+                mask = batch["mask"].to(device, non_blocking=True)
+                try:
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        enc   = te(input_ids=ids, attention_mask=mask).last_hidden_state
+                        noise = torch.randn_like(lats)
+                        ts    = torch.randint(0, sch.config.num_train_timesteps, (lats.shape[0],), device=device).long()
+                        nl    = sch.add_noise(lats, noise, ts)
+                        pred  = unet(nl, ts, enc).sample
+                        loss  = F.mse_loss(pred, noise) / ga
+                    scaler.scale(loss).backward()
+                    if (gs + 1) % ga == 0:
+                        scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+                except torch.cuda.OutOfMemoryError:
+                    print("\n\n  " + clr("OUT OF VRAM at step " + str(gs), R))
+                    print("  " + clr("lower batch size or resolution and retry", Y))
+                    print("  " + clr("checkpoint saved up to step " + str(gs), G))
+                    bar.close(); pause(); return
+                except Exception as ex:
+                    print("\n  " + clr("step error: " + str(ex) + "  skipping", Y))
+                    opt.zero_grad(set_to_none=True); gs += 1; bar.update(1); continue
 
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                enc_hidden    = text_encoder(input_ids=input_ids, attention_mask=attn_mask).last_hidden_state
-                noise         = torch.randn_like(latents)
-                timesteps     = torch.randint(0, scheduler.config.num_train_timesteps,
-                                              (latents.shape[0],), device=device).long()
-                noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                noise_pred    = unet(noisy_latents, timesteps, enc_hidden).sample
-                loss          = torch.nn.functional.mse_loss(noise_pred, noise) / grad_accum
+                gs += 1
+                elapsed = time.time() - t0
+                eta     = (elapsed / gs) * (ms - gs) if gs > 0 else 0
+                mem     = gpu_used()
+                bar.update(1)
+                bar.set_postfix(loss=str(round(loss.item()*ga, 4)),
+                                vram=str(round(mem,2))+"GB",
+                                eta=str(timedelta(seconds=int(eta))))
+                if gs % sv == 0: bar.clear(); save_st(unet, te, ckd, gs)
+                if gs >= ms: break
+    except KeyboardInterrupt:
+        print("\n\n  " + clr("stopped.  saving...", Y))
+        save_st(unet, te, ckd, gs)
+        bar.close(); pause(); return
 
-            scaler.scale(loss).backward()
-
-            if (global_step + 1) % grad_accum == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            global_step += 1
-
-            elapsed = time.time() - start_time
-            eta_sec = (elapsed / global_step) * (max_steps - global_step) if global_step > 0 else 0
-            eta_str = str(timedelta(seconds=int(eta_sec)))
-            mem     = torch.cuda.memory_allocated() / 1024**3
-
-            pbar.update(1)
-            pbar.set_postfix(
-                loss=f"{loss.item() * grad_accum:.4f}",
-                VRAM=f"{mem:.2f}GB",
-                ETA=eta_str
-            )
-
-            if global_step % save_every == 0:
-                pbar.clear()
-                save_checkpoint_st(unet, text_encoder, checkpoint_dir, global_step)
-
-            if global_step >= max_steps:
-                break
-
-    pbar.close()
-
-    section("Saving Final Model")
-    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_path  = os.path.join(checkpoint_dir, f"finetuned_final_{ts}.safetensors")
-    final_state = {k: v for k, v in unet.state_dict().items() if "lora_" in k}
-    final_state.update({k: v for k, v in text_encoder.state_dict().items() if "lora_" in k})
-    save_file(final_state, final_path)
-    print(f"  {clr('✓', G)} {final_path}")
-    print(f"\n  {clr('Done!', G)}\n")
+    bar.close()
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fout = os.path.join(ckd, "finetuned_" + ts + ".safetensors")
+    st   = {k:v for k,v in unet.state_dict().items() if "lora_" in k}
+    st.update({k:v for k,v in te.state_dict().items() if "lora_" in k})
+    save_file(st, fout)
+    print("  " + clr("saved -> " + fout, G))
+    print("\n  " + clr("fine tuning done.", G) + "\n")
 
 
+# ── standard train ────────────────────────────────────────────────
 def run_training(cfg):
-    section("Loading Models  [Training Mode]")
+    sec("Standard LoRA Training")
+    dd   = cfg["data_dir"];        ckd  = cfg["checkpoint_dir"]
+    mid  = cfg["model_id"];        res  = int(cfg["resolution"])
+    bs   = int(cfg["batch_size"]); ms   = int(cfg["max_steps"])
+    sv   = int(cfg["save_every"]); lr   = float(cfg["lr"])
+    rank = int(cfg["rank"]);       alp  = int(cfg["alpha"])
+    nw   = int(cfg.get("num_workers",4))
+    wts  = cfg.get("weights_path")
 
-    data_dir       = cfg["data_dir"]
-    checkpoint_dir = cfg["checkpoint_dir"]
-    model_id       = cfg["model_id"]
-    resolution     = int(cfg["resolution"])
-    batch_size     = int(cfg["batch_size"])
-    max_steps      = int(cfg["max_steps"])
-    save_every     = int(cfg["save_every"])
-    lr             = float(cfg["lr"])
-    rank           = int(cfg["rank"])
-    alpha          = int(cfg["alpha"])
-    weights        = cfg.get("weights_path")
+    os.makedirs(ckd, exist_ok=True)
+    print("  " + clr("model   ", DIM) + mid)
+    print("  " + clr("data    ", DIM) + dd)
+    print("  " + clr("output  ", DIM) + ckd)
 
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    print("  " + clr("\nloading model...", C))
+    try:
+        tok  = CLIPTokenizer.from_pretrained(mid, subfolder="tokenizer")
+        te   = CLIPTextModel.from_pretrained(mid, subfolder="text_encoder").to(device)
+        vae  = AutoencoderKL.from_pretrained(mid, subfolder="vae").to(device)
+        unet = UNet2DConditionModel.from_pretrained(mid, subfolder="unet").to(device)
+        sch  = DDPMScheduler.from_pretrained(mid, subfolder="scheduler")
+    except Exception as ex:
+        print("  " + clr("failed to load: " + str(ex), R)); pause(); return
 
-    print(f"  {clr('Base model', DIM)} {model_id}")
-    print(f"  {clr('Data dir  ', DIM)} {data_dir}")
-    print(f"  {clr('Output    ', DIM)} {checkpoint_dir}")
-    if weights:
-        print(f"  {clr('Weights   ', DIM)} {weights}")
+    for p in unet.parameters(): p.requires_grad = False
+    for p in te.parameters():   p.requires_grad = False
+    for p in vae.parameters():  p.requires_grad = False
 
-    tokenizer    = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
-    vae          = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
-    unet         = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
-    scheduler    = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
-
-    for p in unet.parameters():         p.requires_grad = False
-    for p in text_encoder.parameters(): p.requires_grad = False
-    for p in vae.parameters():          p.requires_grad = False
-
-    target_modules = ["to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"]
-    unet = get_peft_model(unet, LoraConfig(
-        r=rank, lora_alpha=alpha,
-        target_modules=target_modules,
-        lora_dropout=0.05, bias="none"
-    ))
+    try:
+        unet = get_peft_model(unet, LoraConfig(
+            r=rank, lora_alpha=alp,
+            target_modules=["to_q","to_k","to_v","to_out.0","ff.net.0.proj","ff.net.2"],
+            lora_dropout=.05, bias="none"
+        ))
+    except Exception as ex:
+        print("  " + clr("LoRA setup failed: " + str(ex), R)); pause(); return
 
     trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    print(f"  {clr('✓', G)} Trainable params: {clr(f'{trainable:,}', W)}")
+    print("  " + clr("trainable: " + "{:,}".format(trainable), G))
 
-    latest_ckpt, completed = find_latest_checkpoint(checkpoint_dir)
-    if latest_ckpt:
-        print(f"\n  {clr('↺', Y)} Resuming from step_{completed}")
-        load_weights_into_unet(unet, latest_ckpt)
-    elif weights:
-        print(f"\n  {clr('→', C)} Loading weights: {Path(weights).name}")
-        load_weights_into_unet(unet, weights)
+    latest, done = find_latest(ckd)
+    if latest:
+        print("\n  " + clr("resuming from step " + str(done), Y))
+        try: load_into(unet, latest)
+        except Exception as ex: print("  " + clr("could not load checkpoint: " + str(ex), Y))
+    elif wts:
+        print("\n  " + clr("loading weights: " + Path(wts).name, C))
+        try: load_into(unet, wts)
+        except Exception as ex: print("  " + clr("could not load weights: " + str(ex), Y))
     else:
-        print(f"\n  {clr('→', C)} Starting fresh from base model")
+        print("\n  " + clr("starting fresh", C))
 
-    if completed >= max_steps:
-        print(f"\n  {clr('✓', G)} Already at {completed}/{max_steps} — nothing to do!")
-        input("\n  Press Enter...")
-        return
+    if done >= ms:
+        print("\n  " + clr("already at " + str(done) + " steps, nothing to do", G))
+        pause(); return
 
     try:
         unet.enable_xformers_memory_efficient_attention()
-        print(f"  {clr('✓', G)} xformers enabled")
-    except Exception:
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            print(f"  {clr('✓', G)} Flash attention enabled")
-        except Exception:
-            pass
+        print("  " + clr("xformers on", G))
+    except:
+        try: torch.backends.cuda.enable_flash_sdp(True); print("  " + clr("flash attention on", G))
+        except: pass
 
-    section("Loading Dataset")
-    print(f" {clr('ℹ', C)} {clr('Don’t worry if it looks stuck, speed depends on your GPU’s VRAM', DIM)}\n")
-    dataset = ImageCaptionDataset(data_dir, tokenizer, resolution)
-    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    sec("Loading Dataset")
+    try:
+        ds = ImageCaptionDataset(dd, tok, res)
+        dl = DataLoader(ds, batch_size=bs, shuffle=True, num_workers=0)
+    except Exception as ex:
+        print("  " + clr("dataset error: " + str(ex), R)); pause(); return
 
-    optimizer = AdamW(
-        [p for p in unet.parameters() if p.requires_grad],
-        lr=lr, betas=(0.9, 0.999), weight_decay=0.01
-    )
+    if len(ds) == 0:
+        print("  " + clr("no images found in " + dd, R)); pause(); return
+
+    opt    = AdamW([p for p in unet.parameters() if p.requires_grad], lr=lr, betas=(.9,.999), weight_decay=.01)
     scaler = torch.cuda.amp.GradScaler()
+    gs     = done; t0 = time.time()
 
-    section("Training")
-    print(f"  {clr('Steps', DIM)} {completed} → {max_steps}  ({clr(str(max_steps - completed), W)} remaining)\n")
+    sec("Training")
+    print("  " + clr("steps " + str(done) + " to " + str(ms) + "\n", DIM))
+    bar = tqdm(total=ms, initial=done, desc="  training", unit="step", dynamic_ncols=True, colour="cyan")
 
-    global_step = completed
-    start_time  = time.time()
-    pbar        = tqdm(total=max_steps, initial=completed, desc="  Training",
-                       unit="step", dynamic_ncols=True, colour="cyan")
+    try:
+        while gs < ms:
+            for imgs, ids in dl:
+                st0  = time.time()
+                imgs = imgs.to(device); ids = ids.to(device)
+                try:
+                    with torch.no_grad():
+                        lats = vae.encode(imgs).latent_dist.sample() * 0.18215
+                        enc  = te(ids)[0]
+                    noise = torch.randn_like(lats)
+                    ts    = torch.randint(0, sch.config.num_train_timesteps, (lats.shape[0],), device=device).long()
+                    nl    = sch.add_noise(lats, noise, ts)
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        pred = unet(nl, ts, enc).sample
+                        loss = F.mse_loss(pred, noise)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_([p for p in unet.parameters() if p.requires_grad], 1.0)
+                    scaler.step(opt); scaler.update(); opt.zero_grad()
+                except torch.cuda.OutOfMemoryError:
+                    print("\n\n  " + clr("OUT OF VRAM at step " + str(gs), R))
+                    print("  " + clr("lower batch size or resolution and retry", Y))
+                    print("  " + clr("checkpoint saved up to step " + str(gs), G))
+                    bar.close(); pause(); return
+                except Exception as ex:
+                    print("\n  " + clr("step error: " + str(ex) + "  skipping", Y))
+                    opt.zero_grad(); gs += 1; bar.update(1); continue
 
-    while global_step < max_steps:
-        for images, input_ids in loader:
-            step_start = time.time()
-            images     = images.to(device)
-            input_ids  = input_ids.to(device)
+                gs += 1
+                elapsed = time.time() - t0
+                eta     = (elapsed / (gs-done)) * (ms-gs) if (gs-done) > 0 else 0
+                mem     = gpu_used()
+                bar.update(1)
+                bar.set_postfix(loss=str(round(loss.item(),4)),
+                                spt=str(round(time.time()-st0,2))+"s",
+                                vram=str(round(mem,2))+"GB",
+                                eta=str(timedelta(seconds=int(eta))))
+                if gs % sv == 0: bar.clear(); save_pt(unet, ckd, gs)
+                if gs >= ms: break
+    except KeyboardInterrupt:
+        print("\n\n  " + clr("stopped.  saving...", Y))
+        save_pt(unet, ckd, gs)
+        bar.close(); pause(); return
 
-            with torch.no_grad():
-                latents               = vae.encode(images).latent_dist.sample() * 0.18215
-                encoder_hidden_states = text_encoder(input_ids)[0]
-
-            noise         = torch.randn_like(latents)
-            timesteps     = torch.randint(0, scheduler.config.num_train_timesteps,
-                                          (latents.shape[0],), device=device).long()
-            noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(pred, noise)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_([p for p in unet.parameters() if p.requires_grad], 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            global_step += 1
-
-            elapsed  = time.time() - start_time
-            done     = global_step - completed
-            eta_sec  = (elapsed / done) * (max_steps - global_step) if done > 0 else 0
-            eta_str  = str(timedelta(seconds=int(eta_sec)))
-            mem      = torch.cuda.memory_allocated() / 1024**3
-            step_t   = time.time() - step_start
-
-            pbar.update(1)
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                step=f"{step_t:.2f}s",
-                VRAM=f"{mem:.2f}GB",
-                ETA=eta_str
-            )
-
-            if global_step % save_every == 0:
-                pbar.clear()
-                save_checkpoint_pt(unet, checkpoint_dir, global_step)
-
-            if global_step >= max_steps:
-                break
-
-    pbar.close()
-
-    section("Saving Final Model")
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    final_pt  = os.path.join(checkpoint_dir, f"final_{ts}.pt")
-    final_st  = os.path.join(checkpoint_dir, f"final_{ts}.safetensors")
-    state     = unet.state_dict()
-    torch.save(state, final_pt)
-    lora_only = {k: v for k, v in state.items() if "lora_" in k}
-    if lora_only:
-        save_file(lora_only, final_st)
-    print(f"  {clr('✓', G)} {final_pt}")
-    print(f"  {clr('✓', G)} {final_st}")
-    print(f"\n  {clr('Done!', G)}\n")
+    bar.close()
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fpt = os.path.join(ckd, "final_" + ts + ".pt")
+    fst = os.path.join(ckd, "final_" + ts + ".safetensors")
+    st  = unet.state_dict()
+    torch.save(st, fpt)
+    lo  = {k:v for k,v in st.items() if "lora_" in k}
+    if lo: save_file(lo, fst)
+    print("  " + clr("saved -> " + fpt, G))
+    print("  " + clr("saved -> " + fst, G))
+    print("\n  " + clr("training done.", G) + "\n")
 
 
+# ── generate ──────────────────────────────────────────────────────
 def run_generate(cfg):
-    section("Image Generation")
+    sec("Generate Images")
+    mid    = cfg["model_id"];  lp = cfg.get("lora_path")
+    odir   = Path(cfg["output_dir"]); prompt = cfg["prompt"]
+    n      = int(cfg["num_images"]); steps = int(cfg.get("steps",30))
+    cfg_s  = float(cfg.get("guidance",7.5))
 
-    model_id   = cfg["model_id"]
-    lora_path  = cfg.get("lora_path")
-    output_dir = Path(cfg["output_dir"])
-    prompt     = cfg["prompt"]
-    num_images = int(cfg["num_images"])
-    steps      = int(cfg.get("steps", 30))
-    guidance   = float(cfg.get("guidance", 7.5))
+    odir.mkdir(parents=True, exist_ok=True)
+    print("  " + clr("model  ", DIM) + mid)
+    if lp: print("  " + clr("lora   ", DIM) + lp)
+    print("  " + clr("prompt ", DIM) + prompt)
+    print("  " + clr(str(n) + " images  steps=" + str(steps) + "  cfg=" + str(cfg_s), DIM) + "\n")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        print("  " + clr("loading pipeline...", C))
+        pipe = StableDiffusionPipeline.from_pretrained(mid, torch_dtype=torch.float16, safety_checker=None).to(device)
+    except Exception as ex:
+        print("  " + clr("failed to load pipeline: " + str(ex), R)); pause(); return
 
-    print(f"  {clr('Base model', DIM)} {model_id}")
-    if lora_path:
-        print(f"  {clr('LoRA      ', DIM)} {lora_path}")
-    print(f"  {clr('Output    ', DIM)} {output_dir}")
-    print(f"  {clr('Prompt    ', DIM)} {prompt}")
-    print(f"  {clr('Images    ', DIM)} {num_images}  |  {clr('Steps', DIM)} {steps}  |  {clr('CFG', DIM)} {guidance}\n")
+    if lp and os.path.exists(lp):
+        try:
+            pipe.unet.load_state_dict(load_file(lp), strict=False)
+            print("  " + clr("LoRA applied", G))
+        except Exception as ex:
+            print("  " + clr("could not apply LoRA: " + str(ex) + "  using base only", Y))
+    elif lp:
+        print("  " + clr("LoRA file not found, using base model", Y))
 
-    print(f"  {clr('→', C)} Loading pipeline...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        safety_checker=None
-    ).to(device)
+    print("  " + clr("generating...\n", C))
+    for i in tqdm(range(1, n+1), desc="  gen", unit="img", dynamic_ncols=True, colour="cyan"):
+        try:
+            img  = pipe(prompt, num_inference_steps=steps, guidance_scale=cfg_s).images[0]
+            name = "gen_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(i) + ".png"
+            img.save(odir / name)
+        except torch.cuda.OutOfMemoryError:
+            print("\n  " + clr("out of VRAM.  try fewer steps.", R)); break
+        except Exception as ex:
+            print("\n  " + clr("generation error: " + str(ex), Y)); continue
 
-    if lora_path and os.path.exists(lora_path):
-        print(f"  {clr('→', C)} Applying LoRA weights...")
-        lora_state = load_file(lora_path)
-        pipe.unet.load_state_dict(lora_state, strict=False)
-        print(f"  {clr('✓', G)} LoRA applied")
-    elif lora_path:
-        print(f"  {clr('!', Y)} LoRA file not found — running base model only")
-
-    print(f"  {clr('→', C)} Generating {num_images} image(s)...\n")
-
-    for i in tqdm(range(1, num_images + 1), desc="  Generating", unit="img",
-                  dynamic_ncols=True, colour="cyan"):
-        image     = pipe(prompt, num_inference_steps=steps, guidance_scale=guidance).images[0]
-        file_path = output_dir / f"dbot_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.png"
-        image.save(file_path)
-
-    print(f"\n  {clr('✓', G)} Done! Saved to {clr(str(output_dir.resolve()), W)}\n")
+    print("\n  " + clr("done.  saved to " + str(odir.resolve()), G) + "\n")
 
 
-HF_MODELS = [
+# ── HuggingFace search ────────────────────────────────────────────
+def hf_search(query):
+    try:
+        import urllib.request, urllib.parse
+        url = "https://huggingface.co/api/models?search=" + urllib.parse.quote(query)
+        url += "&filter=diffusers&limit=10&sort=downloads"
+        req = urllib.request.Request(url, headers={"User-Agent": "trainer/4.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode())
+        return [(m.get("id",""), m.get("downloads",0)) for m in data if m.get("id")]
+    except: return []
+
+
+HF_PRESETS = [
     "runwayml/stable-diffusion-v1-5",
     "stabilityai/stable-diffusion-2-1",
     "stabilityai/stable-diffusion-xl-base-1.0",
     "dreamlike-art/dreamlike-photoreal-2.0",
     "SG161222/Realistic_Vision_V5.1_noVAE",
+    "Lykon/dreamshaper-8",
+    "stablediffusionapi/realistic-vision-v6.0-b1-inpaint",
 ]
 
-PRESETS = {
-    "1": ("Higher Resolution  512→768",              dict(resolution=768,  batch_size=2)),
-    "2": ("Higher Resolution  512→1024",             dict(resolution=1024, batch_size=1)),
-    "3": ("Higher Rank  128→192",                    dict(rank=192, alpha=384)),
-    "4": ("More Steps  +8000",                       dict(max_steps=24000)),
-    "5": ("Faster Training  (rank↓ batch↑)",         dict(rank=64, alpha=128, batch_size=8)),
-    "6": ("Quality Pack  768 + rank192 + 20k steps", dict(resolution=768, rank=192, alpha=384, max_steps=20000, batch_size=2)),
+
+def _pick_model_search():
+    """
+    Terminal model picker with HuggingFace search.
+    Returns (model_id, profile_dict).
+    """
+    sec("Pick a Base Model")
+    print("  " + clr("type a number, s to search HuggingFace, or u to paste a URL\n", DIM))
+    for i, m in enumerate(HF_PRESETS, 1):
+        prof  = detect_from_id(m)
+        badge = clr("[" + prof["label"].split("(")[0].strip() + "]", DIM)
+        print("  " + clr(str(i), C) + "  " + m + "  " + badge)
+    print()
+    print("  " + clr("s", C) + "  search HuggingFace by name")
+    print("  " + clr("u", C) + "  paste a URL or model ID")
+    print()
+
+    while True:
+        ch = input("  " + clr("choice [1]: ", C)).strip() or "1"
+
+        if ch == "u":
+            raw = input("  " + clr("paste model ID or HF URL: ", C)).strip()
+            if "huggingface.co/" in raw:
+                raw = raw.rstrip("/").split("huggingface.co/")[-1].strip("/")
+            if raw:
+                prof = detect_from_id(raw)
+                print("  " + clr("detected: " + prof["label"], G))
+                return raw, prof
+            print("  " + clr("nothing entered", R))
+
+        elif ch == "s":
+            q = input("  " + clr("search: ", C)).strip()
+            if not q: continue
+            print("  " + clr("searching...", C))
+            results = hf_search(q)
+            if not results:
+                print("  " + clr("no results or no internet.  try option u to paste an ID", Y)); continue
+            print()
+            for i, (mid, dl) in enumerate(results, 1):
+                prof  = detect_from_id(mid)
+                badge = clr("[" + prof["label"].split("(")[0].strip() + "]", DIM)
+                print("  " + clr(str(i), C) + "  " + mid + "  " + badge
+                      + "  " + clr(str(dl) + " dl", DIM))
+            print("  " + clr("0", C) + "  search again")
+            print()
+            sc = input("  " + clr("pick one [1]: ", C)).strip() or "1"
+            if sc == "0": continue
+            if sc.isdigit() and 1 <= int(sc) <= len(results):
+                mid  = results[int(sc)-1][0]
+                prof = detect_from_id(mid)
+                print("  " + clr("selected: " + mid, G))
+                print("  " + clr("detected: " + prof["label"], G))
+                return mid, prof
+            print("  " + clr("not valid", R))
+
+        elif ch.isdigit() and 1 <= int(ch) <= len(HF_PRESETS):
+            mid  = HF_PRESETS[int(ch)-1]
+            prof = detect_from_id(mid)
+            print("  " + clr("detected: " + prof["label"], G))
+            return mid, prof
+        else:
+            print("  " + clr("not valid", R))
+
+
+# ── input helpers ─────────────────────────────────────────────────
+def _pick_data_dir(last=""):
+    sec("Training Data Folder")
+    print("  " + clr("path to folder with your images (or videos)", DIM))
+    if last: print("  " + clr("last: " + last, DIM) + "\n")
+    while True:
+        raw = input("  " + clr("path [" + (last or "required") + "]: ", C)).strip()
+        if not raw and last: raw = last
+        if not raw: print("  " + clr("required", R)); continue
+        path = raw.strip('"').strip("'")
+        if not os.path.isdir(path): print("  " + clr("folder not found", R)); continue
+        ni = sum(len(glob.glob(os.path.join(path,"*."+e))) for e in IEXT)
+        nv = sum(len(glob.glob(os.path.join(path,"*."+e))) for e in VEXT)
+        print("  " + clr("found " + str(ni) + " images and " + str(nv) + " videos", G))
+        return path
+
+
+def _pick_out_dir(last="", label="Output Folder"):
+    sec(label)
+    raw = input("  " + clr("path [" + (last or "required") + "]: ", C)).strip()
+    if not raw and last: return last
+    path = raw.strip('"').strip("'")
+    if path: os.makedirs(path, exist_ok=True); return path
+    return last
+
+
+def _pick_weights(ckd):
+    sec("Starting Weights  (optional, enter to skip)")
+    files = [f for f in all_weights(ckd) if not re.search(r"step_\d+\.(pt|safetensors)$",f)]
+    if not files: print("  " + clr("nothing found, starting fresh", DIM)); return None
+    print("  " + clr("0", C) + "  fresh start")
+    for i,f in enumerate(files,1):
+        mb = os.path.getsize(f)/1024**2
+        print("  " + clr(str(i), C) + "  " + Path(f).name + "  " + clr(str(round(mb))+"MB",DIM))
+    print()
+    while True:
+        ch = input("  " + clr("choice [0]: ", C)).strip() or "0"
+        if ch == "0": return None
+        if ch.isdigit() and 1 <= int(ch) <= len(files): return files[int(ch)-1]
+        print("  " + clr("not valid", R))
+
+
+def _pick_lora(dirs):
+    sec("LoRA File  (optional, enter to skip)")
+    files = []
+    for d in list(dirs) + [os.getcwd()]:
+        if d and os.path.isdir(d):
+            for f in glob.glob(os.path.join(d,"*.safetensors")):
+                if f not in files: files.append(f)
+    if not files:
+        raw = input("  " + clr("no files found  paste path or enter to skip: ", C)).strip().strip('"').strip("'")
+        return raw if raw and os.path.exists(raw) else None
+    print("  " + clr("0", C) + "  none")
+    for i,f in enumerate(files,1):
+        mb = os.path.getsize(f)/1024**2
+        print("  " + clr(str(i), C) + "  " + Path(f).name + "  " + clr(str(round(mb))+"MB",DIM))
+    print("  " + clr("m", C) + "  type a path")
+    print()
+    while True:
+        ch = input("  " + clr("choice [0]: ", C)).strip() or "0"
+        if ch == "0": return None
+        if ch == "m":
+            raw = input("  " + clr("path: ", C)).strip().strip('"').strip("'")
+            if raw and os.path.exists(raw): return raw
+            print("  " + clr("not found", R))
+        elif ch.isdigit() and 1 <= int(ch) <= len(files): return files[int(ch)-1]
+        else: print("  " + clr("not valid", R))
+
+
+def _pick_existing_lora(ckd):
+    sec("Existing LoRA  (optional)")
+    files = all_weights(ckd)
+    if not files: print("  " + clr("nothing found, starting fresh", DIM)); return None
+    print("  " + clr("0", C) + "  fresh start")
+    for i,f in enumerate(files,1):
+        mb = os.path.getsize(f)/1024**2
+        print("  " + clr(str(i), C) + "  " + Path(f).name + "  " + clr(str(round(mb))+"MB",DIM))
+    print()
+    while True:
+        ch = input("  " + clr("choice [0]: ", C)).strip() or "0"
+        if ch == "0": return None
+        if ch.isdigit() and 1 <= int(ch) <= len(files): return files[int(ch)-1]
+        print("  " + clr("not valid", R))
+
+
+def _get_train_settings(ckd, prof=None):
+    sec("Training Settings")
+    p  = vram_preset(prof)
+    gb = gpu_gb()
+    if gb > 0:
+        print("  " + clr("GPU: " + str(round(gb,1)) + "GB  -> " + p["label"], Y))
+        if prof: print("  " + clr("model: " + prof["label"], C))
+        print("  " + clr("press enter to accept each default\n", DIM))
+
+    latest, step = find_latest(ckd)
+    if latest: print("  " + clr("checkpoint at step " + str(step) + ", will auto-resume\n", G))
+
+    # standard train: resolution is flexible, boosts available
+    res  = _ask("resolution (512 / 768 / 1024)",  p["res"],   int)
+    bs   = _ask("batch size",                     p["bs"],    int)
+    ms   = _ask("total steps",                    p["steps"], int)
+    sv   = _ask("save every N steps",             p["save"],  int)
+    lr   = _ask("learning rate",                  p["lr"],    float)
+    rank = _ask("LoRA rank",                      p["rank"],  int)
+    alp  = _ask("LoRA alpha",                     p["alpha"], int)
+    nw   = _ask("dataloader workers",             p["nw"],    int)
+    if res >= 1024 and bs > 1: print("  " + clr("1024px: batch set to 1",Y)); bs = 1
+    return dict(resolution=res, batch_size=bs, max_steps=ms, save_every=sv,
+                lr=lr, rank=rank, alpha=alp, num_workers=nw)
+
+
+def _get_ft_settings(ckd, prof=None):
+    sec("Fine Tune Settings")
+    p  = vram_preset(prof)
+    pr = prof or _DEFAULT
+    gb = gpu_gb()
+    if gb > 0: print("  " + clr("GPU: " + str(round(gb,1)) + "GB  -> " + p["label"], Y))
+    if prof:
+        print("  " + clr("model: " + prof["label"], C))
+        print("  " + clr("note:  " + prof["note"], Y))
+        if prof["min_res"] > 512:
+            print("  " + clr("minimum resolution for this model: " + str(prof["min_res"]) + "px", R))
+    print("  " + clr("\npress enter to accept each default\n", DIM))
+
+    # fine tune: resolution is ENFORCED at model minimum (will error below it)
+    res  = _validated_ask("resolution",             p["res"],   int,   pr, "res")
+    bs   = _ask("batch size",                       p["bs"],    int)
+    ga   = _ask("gradient accumulation",            p["ga"],    int)
+    ms   = _ask("total steps",                      p["steps"], int)
+    sv   = _ask("save every N steps",               p["save"],  int)
+    ulr  = _ask("UNet learning rate",               3e-5,       float)
+    tlr  = _ask("text encoder learning rate",       1e-5,       float)
+    ur   = _validated_ask("UNet LoRA rank",         p["ur"],    int,   pr, "rank")
+    ua   = _ask("UNet LoRA alpha",                  p["ua"],    int)
+    tr   = _validated_ask("text encoder LoRA rank", p["tr"],    int,   pr, "te_rank")
+    ta   = _ask("text encoder LoRA alpha",          p["ta"],    int)
+    drop = _ask("LoRA dropout",                     p["drop"],  float)
+    nw   = _ask("dataloader workers",               p["nw"],    int)
+    gc   = _ask("gradient checkpointing y/n",       "y" if p["gc"] else "n", str)
+    if res >= 1024 and bs > 1: print("  " + clr("1024px: batch set to 1",Y)); bs = 1
+    return dict(resolution=res, batch_size=bs, grad_accum=ga, max_steps=ms,
+                save_every=sv, unet_lr=ulr, text_lr=tlr, unet_rank=ur,
+                unet_alpha=ua, te_rank=tr, te_alpha=ta, dropout=drop,
+                num_workers=nw, gradient_checkpointing=(str(gc).strip().lower()!="n"))
+
+
+BOOSTS = {
+    "1": ("resolution -> 768",        dict(resolution=768,  batch_size=2)),
+    "2": ("resolution -> 1024",       dict(resolution=1024, batch_size=1)),
+    "3": ("rank -> 192",              dict(rank=192, alpha=384)),
+    "4": ("+8k steps",                dict(max_steps=24000)),
+    "5": ("fast mode (rank 64 bs 8)", dict(rank=64, alpha=128, batch_size=8)),
+    "6": ("full quality pack",        dict(resolution=768, rank=192, alpha=384, max_steps=20000, batch_size=2)),
 }
 
-
-def ask(label, default, cast=str):
-    v = input(f"  {clr(label, C)} [{clr(str(default), W)}]: ").strip()
-    if not v:
-        return default
-    try:
-        return cast(v)
-    except Exception:
-        return default
-
-
-def pick_data_dir(default=""):
-    section("Training Data Folder")
-    print(f"  {clr('Enter the path to your image/video dataset folder.', DIM)}")
-    if default:
-        print(f"  {clr('Last used:', DIM)} {default}\n")
-    while True:
-        path = input(f"  {clr('Path', C)} [{clr(default or 'required', W)}]: ").strip()
-        if not path and default:
-            path = default
-        if not path:
-            print(f"  {clr('A data directory is required.', R)}")
-            continue
-        path = path.strip('"').strip("'")
-        if not os.path.isdir(path):
-            print(f"  {clr('Directory not found. Try again.', R)}")
-            continue
-        img_count = sum(
-            len(glob.glob(os.path.join(path, f"*.{ext}")))
-            for ext in ["png", "jpg", "jpeg", "webp", "bmp", "tiff"]
-        )
-        vid_count = sum(
-            len(glob.glob(os.path.join(path, f"*.{ext}")))
-            for ext in VIDEO_EXTENSIONS
-        ) if CV2_AVAILABLE else 0
-        print(f"  {clr('✓', G)} Found {clr(str(img_count), W)} images, {clr(str(vid_count), W)} videos")
-        return path
-
-
-def pick_output_dir(default="", label="Output / Checkpoint Folder"):
-    section(label)
-    print(f"  {clr('Where to save checkpoints and final weights.', DIM)}")
-    if default:
-        print(f"  {clr('Last used:', DIM)} {default}\n")
-    path = input(f"  {clr('Path', C)} [{clr(default or 'required', W)}]: ").strip()
-    if not path and default:
-        return default
-    path = path.strip('"').strip("'")
-    if path:
-        os.makedirs(path, exist_ok=True)
-        print(f"  {clr('✓', G)} Folder ready")
-        return path
-    return default
-
-
-def pick_model():
-    section("Select SD Base Model")
-    print(f"  {clr('The base Stable Diffusion model to use.', DIM)}\n")
-    for i, m in enumerate(HF_MODELS, 1):
-        print(f"  {clr(str(i), C)}.  {m}")
-    print(f"  {clr('c', C)}.  Custom HuggingFace ID")
+def _apply_boosts(cfg):
+    sec("Quality Boosts  (standard train only)")
+    print("  " + clr("note: these are for standard train. fine tune uses model-native settings.\n", DIM))
+    for k,(nm,_) in BOOSTS.items(): print("  " + clr(k,C) + "  " + nm)
+    print("  " + clr("0",C) + "  keep as is")
     print()
-    while True:
-        ch = input(f"  {clr('Model', C)} [{clr('1', W)}]: ").strip() or "1"
-        if ch == "c":
-            v = input(f"  {clr('HF ID', C)}: ").strip()
-            if v:
-                return v
-        elif ch.isdigit() and 1 <= int(ch) <= len(HF_MODELS):
-            return HF_MODELS[int(ch) - 1]
-        print(f"  {clr('Invalid.', R)}")
+    ch = input("  " + clr("pick (or combine like 1,3): ", C)).strip()
+    if not ch or ch == "0": return cfg
+    for part in re.split(r"[,\s]+", ch):
+        if part in BOOSTS:
+            cfg.update(BOOSTS[part][1])
+            print("  " + clr("applied: " + BOOSTS[part][0], G))
+    if cfg.get("resolution",0) >= 1024: cfg["batch_size"] = 1
+    return cfg
 
+# ── tutorial (Ctrl+U style - terminal tutorial + image upload guide) ─
+def show_tutorial():
+    clear()
+    print(clr("=" * 60, C))
+    print(clr("  Tutorial  |  How to use this trainer", BOLD))
+    print(clr("=" * 60, C) + "\n")
 
-def pick_lora_for_generation(search_dirs):
-    section("Select LoRA Weights")
-    print(f"  {clr('Pick a .safetensors file to apply to the model.', DIM)}")
-    print(f"  {clr('Searches your output folders and current directory.', DIM)}\n")
-
-    files    = []
-    searched = list(search_dirs) + [os.getcwd()]
-    for d in searched:
-        if d and os.path.isdir(d):
-            for f in glob.glob(os.path.join(d, "*.safetensors")):
-                if f not in files:
-                    files.append(f)
-
-    if not files:
-        print(f"  {clr('No .safetensors files found in known folders.', DIM)}")
-        custom = input(f"  {clr('Enter full path manually (or Enter to skip)', C)}: ").strip().strip('"').strip("'")
-        return custom if custom and os.path.exists(custom) else None
-
-    print(f"  {clr('0', C)}.  None — use base model only")
-    for i, f in enumerate(files, 1):
-        size = os.path.getsize(f) / 1024**2
-        print(f"  {clr(str(i), C)}.  {Path(f).name}  {clr(f'({size:.0f} MB)', DIM)}  {clr(str(Path(f).parent), DIM)}")
-    print(f"  {clr('m', C)}.  Enter path manually")
-    print()
-
-    while True:
-        ch = input(f"  {clr('Choice', C)} [{clr('0', W)}]: ").strip() or "0"
-        if ch == "0":
-            return None
-        if ch == "m":
-            custom = input(f"  {clr('Full path', C)}: ").strip().strip('"').strip("'")
-            if custom and os.path.exists(custom):
-                return custom
-            print(f"  {clr('File not found.', R)}")
-        elif ch.isdigit() and 1 <= int(ch) <= len(files):
-            return files[int(ch) - 1]
-        else:
-            print(f"  {clr('Invalid.', R)}")
-
-
-def pick_weights(checkpoint_dir):
-    section("Starting Weights  (optional)")
-    print(f"  {clr('Load existing weights to continue training from.', DIM)}")
-    print(f"  {clr('Skip to start fresh from the base model.', DIM)}\n")
-
-    files = [
-        f for f in find_all_weights(checkpoint_dir)
-        if not re.search(r"step_\d+\.(pt|safetensors)$", f)
+    sections = [
+        ("QUICK START  (the most common workflow)", [
+            "1. Resize        -> menu 2  set 512x512 or 768x768",
+            "2. Caption       -> menu 3  auto-labels your images",
+            "3. Train         -> menu 4  standard LoRA (recommended for beginners)",
+            "4. Generate      -> menu 7  test your trained LoRA",
+        ]),
+        ("IMAGE EDITING  (menu 9)", [
+            "Face Swap      - replaces a face in any photo. needs insightface.",
+            "Face Restore   - sharpens/fixes blurry faces. GFPGAN if installed, else PIL.",
+            "img2img        - re-draw an image guided by a text prompt.",
+            "Filters        - brightness, contrast, sharpen, blur, saturation, flip.",
+            "Batch Restore  - runs face restore on an entire folder at once.",
+        ]),
+        ("UPLOADING AN IMAGE", [
+            "At any image path prompt just type the path and press enter.",
+            "On Windows:  C:\\Users\\you\\Desktop\\photo.jpg",
+            "On Linux:    /home/you/photo.jpg",
+            "You can drag a file from explorer into the terminal to auto-paste the path.",
+            "Ctrl+U is shown as a reminder at image prompts - it just means type/paste a path.",
+        ]),
+        ("FINE TUNE vs STANDARD TRAIN", [
+            "Standard Train  -> flexible. resolution and rank can be adjusted up or down.",
+            "                   boosts available. easier to experiment with.",
+            "Fine Tune       -> model-aware. resolution is enforced at the model's native size.",
+            "                   going below the model's minimum will be warned and capped.",
+            "                   has dual LoRA (UNet + text encoder) and VAE latent cache.",
+            "                   faster per epoch once cache is built.",
+        ]),
+        ("MODEL TYPES AND WHAT BREAKS", [
+            "SD 1.x    native 512px.  going below 512px = broken output.",
+            "SD 2.x    native 768px.  going below 768px = noisy broken output.",
+            "SDXL      native 1024px. going below 1024px = badly broken output.",
+            "Flux.1    native 1024px. text encoder rank below 16 = broken output.",
+            "The trainer detects which model you loaded and warns you if you set",
+            "something that will break it. It will offer to cap to safe values.",
+        ]),
+        ("COMFYUI SETUP  (menu 8)", [
+            "Installs ComfyUI + 12 essential node packs automatically.",
+            "Includes: Manager, Impact Pack, IP Adapter, ControlNet, ReActor,",
+            "          InstantID, Portrait Master, Ultimate SD Upscale, SUPIR.",
+            "After install: cd ComfyUI && python main.py",
+            "Then open http://127.0.0.1:8188 in your browser.",
+            "Drag any .json workflow into the browser to load it.",
+        ]),
+        ("CHECKPOINTS AND RESUMING", [
+            "Training auto-saves a checkpoint every N steps (you set this).",
+            "If training stops for any reason just run train again with the same",
+            "output folder and it will automatically resume from the last checkpoint.",
+            "Final output is saved as both .pt and .safetensors.",
+        ]),
+        ("GPU MEMORY TIPS", [
+            "Out of VRAM?  lower resolution first, then batch size, then rank.",
+            "Turn gradient checkpointing ON if you are below 12GB.",
+            "Use grad accumulation to compensate for smaller batch sizes.",
+            "xformers helps if installed. Flash attention is the fallback.",
+            "For 6GB cards: res=512 bs=1 ga=32 rank=16 grad_ckpt=on",
+        ]),
     ]
 
-    if not files:
-        print(f"  {clr('No extra weight files found.', DIM)}")
-        print(f"  {clr('→ Starting from base model.', Y)}\n")
-        return None
+    for title, lines in sections:
+        print("  " + clr(title, Y))
+        for l in lines: print("  " + clr("  " + l, DIM))
+        print()
 
-    print(f"  {clr('0', C)}.  None — start fresh")
-    for i, f in enumerate(files, 1):
-        size = os.path.getsize(f) / 1024**2
-        print(f"  {clr(str(i), C)}.  {Path(f).name}  {clr(f'({size:.0f} MB)', DIM)}")
-    print()
-
-    while True:
-        ch = input(f"  {clr('Choice', C)} [{clr('0', W)}]: ").strip() or "0"
-        if ch == "0":
-            return None
-        if ch.isdigit() and 1 <= int(ch) <= len(files):
-            return files[int(ch) - 1]
-        print(f"  {clr('Invalid.', R)}")
+    print("  " + clr("=" * 58, DIM))
+    print("  " + clr("press enter to return to the menu", DIM))
+    pause("")
 
 
-def pick_training_settings(checkpoint_dir):
-    section("Training Settings")
-    ckpt, step = find_latest_checkpoint(checkpoint_dir)
-    if ckpt:
-        print(f"  {clr('✓', G)} Checkpoint found: step_{step} — will auto-resume\n")
+# ── comfyui installer ─────────────────────────────────────────────
+CNODES = [
+    ("ComfyUI Manager",          "https://github.com/ltdrdata/ComfyUI-Manager"),
+    ("Impact Pack",              "https://github.com/ltdrdata/ComfyUI-Impact-Pack"),
+    ("IP Adapter Plus",          "https://github.com/cubiq/ComfyUI_IPAdapter_plus"),
+    ("ControlNet Preprocessors", "https://github.com/Fannovel16/comfyui_controlnet_aux"),
+    ("rgthree comfy",            "https://github.com/rgthree/rgthree-comfy"),
+    ("KJNodes",                  "https://github.com/kijai/ComfyUI-KJNodes"),
+    ("ComfyUI Easy Use",         "https://github.com/yolain/ComfyUI-Easy-Use"),
+    ("ReActor Node",             "https://github.com/Gourieff/comfyui-reactor-node"),
+    ("InstantID FaceSwap",       "https://github.com/nosiu/comfyui-instantId-faceswap"),
+    ("Portrait Master v3",       "https://github.com/florestefano1975/comfyui-portrait-master"),
+    ("Ultimate SD Upscale",      "https://github.com/ssitu/ComfyUI_UltimateSDUpscale"),
+    ("SUPIR",                    "https://github.com/kijai/ComfyUI-SUPIR"),
+    ("DeepFuze",                 "https://github.com/SamKhoze/ComfyUI-DeepFuze"),
+]
 
-    resolution = ask("Resolution (512 / 768 / 1024)", 512, int)
-    batch_size = ask("Batch size", 4, int)
-    max_steps  = ask("Max steps", 16000, int)
-    save_every = ask("Save every N steps", 4000, int)
-    lr         = ask("Learning rate", 3e-5, float)
-    rank       = ask("LoRA rank", 128, int)
-    alpha      = ask("LoRA alpha", 256, int)
-
-    if resolution >= 1024 and batch_size > 1:
-        print(f"\n  {clr('! 1024px — auto-setting batch to 1 for VRAM safety.', Y)}")
-        batch_size = 1
-
-    return dict(
-        resolution=resolution, batch_size=batch_size,
-        max_steps=max_steps, save_every=save_every,
-        lr=lr, rank=rank, alpha=alpha
-    )
-
-
-def pick_finetune_settings():
-    section("Fine-Tune Settings")
-    print(f"  {clr('Advanced LoRA fine-tuning with separate UNet + Text Encoder rates.', DIM)}\n")
-
-    resolution = ask("Resolution (512 / 768 / 1024)", 512, int)
-    batch_size = ask("Batch size", 2, int)
-    grad_accum = ask("Gradient accumulation steps", 8, int)
-    max_steps  = ask("Max steps", 4000, int)
-    save_every = ask("Save every N steps", 4000, int)
-    unet_lr    = ask("UNet learning rate", 3e-5, float)
-    text_lr    = ask("Text encoder learning rate", 1e-5, float)
-    unet_rank  = ask("UNet LoRA rank", 128, int)
-    unet_alpha = ask("UNet LoRA alpha", 80, int)
-    te_rank    = ask("Text encoder LoRA rank", 32, int)
-    te_alpha   = ask("Text encoder LoRA alpha", 24, int)
-    dropout    = ask("LoRA dropout", 0.03, float)
-    grad_ckpt  = ask("Gradient checkpointing (y/n)", "y", str)
-
-    if resolution >= 1024 and batch_size > 1:
-        print(f"\n  {clr('! 1024px — auto-setting batch to 1.', Y)}")
-        batch_size = 1
-
-    return dict(
-        resolution=resolution, batch_size=batch_size,
-        grad_accum=grad_accum, max_steps=max_steps,
-        save_every=save_every, unet_lr=unet_lr,
-        text_lr=text_lr, unet_rank=unet_rank,
-        unet_alpha=unet_alpha, te_rank=te_rank,
-        te_alpha=te_alpha, dropout=dropout,
-        gradient_checkpointing=(str(grad_ckpt).strip().lower() != "n")
-    )
+CFACE = [
+    ("onnxruntime",  "onnxruntime-gpu", None),
+    ("basicsr",      "basicsr",         None),
+    ("facexlib",     "facexlib",        None),
+    ("realesrgan",   "realesrgan",      None),
+    ("insightface",  "insightface",
+     "needs Visual C++ Build Tools on Windows.\n"
+     "  get them at: visualstudio.microsoft.com/visual-cpp-build-tools\n"
+     "  install the C++ workload, restart, try again.\n"
+     "  the installer above tried a pre-built wheel automatically."),
+]
 
 
-def pick_existing_lora(checkpoint_dir):
-    section("Existing LoRA Weights  (optional)")
-    print(f"  {clr('Load a previously trained LoRA to continue fine-tuning from it.', DIM)}\n")
-
-    files = find_all_weights(checkpoint_dir)
-    if not files:
-        print(f"  {clr('No weight files found. Starting fresh.', DIM)}\n")
-        return None
-
-    print(f"  {clr('0', C)}.  None — start from base model only")
-    for i, f in enumerate(files, 1):
-        size = os.path.getsize(f) / 1024**2
-        print(f"  {clr(str(i), C)}.  {Path(f).name}  {clr(f'({size:.0f} MB)', DIM)}")
-    print()
-
-    while True:
-        ch = input(f"  {clr('Choice', C)} [{clr('0', W)}]: ").strip() or "0"
-        if ch == "0":
-            return None
-        if ch.isdigit() and 1 <= int(ch) <= len(files):
-            return files[int(ch) - 1]
-        print(f"  {clr('Invalid.', R)}")
+def _git_clone(name, url, parent):
+    folder = url.rstrip("/").split("/")[-1]
+    dest   = os.path.join(parent, folder)
+    if os.path.isdir(dest):
+        print("  " + clr("already there  ", G) + name); return True
+    print("  " + clr("cloning  ", C) + name)
+    try:
+        r = subprocess.run(["git","clone","--depth","1",url,dest],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            print("  " + clr("done     ", G) + name); return True
+        print("  " + clr("failed   ", R) + name + "  " + clr(r.stderr.strip()[:60],DIM))
+        return False
+    except FileNotFoundError:
+        print("  " + clr("git not found  install it from git-scm.com", R)); return False
+    except Exception as ex:
+        print("  " + clr("error  ", R) + name + "  " + str(ex)); return False
 
 
-def pick_improvements(cfg):
-    section("Quality Improvements")
-    rank_val = cfg.get("rank", cfg.get("unet_rank", "—"))
-    print(f"  {clr('Current:', DIM)} res={cfg['resolution']}  rank={rank_val}  "
-          f"steps={cfg['max_steps']}  batch={cfg['batch_size']}\n")
+def install_comfyui():
+    sec("ComfyUI Auto Installer")
+    print("  " + clr("installs ComfyUI and all essential node packs.", DIM))
+    print("  " + clr("anything already installed gets skipped. safe to re-run.\n", DIM))
 
-    for k, (name, _) in PRESETS.items():
-        print(f"  {clr(k, C)}.  {name}")
-    print(f"  {clr('0', C)}.  Keep current settings\n")
+    default = os.path.join(os.path.expanduser("~"), "ComfyUI")
+    raw     = input("  " + clr("install location [" + default + "]: ", C)).strip().strip('"').strip("'")
+    root    = raw if raw else default
+    cdir    = os.path.join(root, "ComfyUI")
+    ndir    = os.path.join(cdir, "custom_nodes")
 
-    ch = input(f"  {clr('Choose (combine e.g. 3,4)', C)}: ").strip()
-    if not ch or ch == "0":
-        return cfg
+    # step 1: pip packages
+    sec("Step 1/3  pip packages")
+    print("  " + clr("face tools and upscaling deps\n", DIM))
+    for mod, pkg, warn in CFACE:
+        try:   __import__(mod); print("  " + clr("ok  ", G) + pkg)
+        except ImportError:
+            ok = pip_install(pkg, [pkg])
+            if not ok and mod == "insightface":
+                print("  " + clr("trying pre-built wheel...", Y))
+                wheel = "https://github.com/Gourieff/Assets/raw/main/insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl"
+                ok2   = pip_install("insightface-wheel", [wheel])
+                if not ok2 and warn:
+                    print()
+                    for ln in warn.split("\n"):
+                        if ln.strip(): print("  " + clr(ln, Y))
+                    print()
+            elif not ok and warn:
+                for ln in warn.split("\n"):
+                    if ln.strip(): print("  " + clr(ln, Y))
+                print()
 
-    for c in re.split(r"[,\s]+", ch):
-        if c in PRESETS:
-            cfg.update(PRESETS[c][1])
-            print(f"  {clr('✓', G)} Applied: {PRESETS[c][0]}")
+    # step 2: ComfyUI core
+    sec("Step 2/3  ComfyUI core")
+    os.makedirs(root, exist_ok=True)
+    if os.path.isdir(cdir):
+        print("  " + clr("already installed at " + cdir, G))
+    else:
+        print("  " + clr("cloning ComfyUI into " + root + "...", C))
+        if not _git_clone("ComfyUI", "https://github.com/comfyanonymous/ComfyUI", root):
+            print("  " + clr("clone failed. check git and internet.", R))
+            pause(); return
+        req = os.path.join(cdir, "requirements.txt")
+        if os.path.exists(req):
+            print("  " + clr("installing ComfyUI requirements...", C) + "\n")
+            skip = {"torch","torchvision","torchaudio"}
+            with open(req,"r",encoding="utf-8") as fh:
+                reqs = [l.strip() for l in fh if l.strip() and not l.strip().startswith("#")]
+            for r in reqs:
+                bare = re.split(r"[>=<!;\[]", r)[0].strip().lower().replace("-","_")
+                if bare in skip: print("  " + clr("skip  ",DIM) + r); continue
+                try:   __import__(bare); print("  " + clr("ok  ",G) + r)
+                except: pip_install(r, [r])
 
-    if cfg["resolution"] >= 1024:
-        cfg["batch_size"] = 1
+    # step 3: node packs
+    sec("Step 3/3  Node Packs")
+    os.makedirs(ndir, exist_ok=True)
+    print("  " + clr("cloning " + str(len(CNODES)) + " packs into " + ndir + "\n", DIM))
+    ok_n = fail_n = 0
+    for name, url in CNODES:
+        if _git_clone(name, url, ndir): ok_n += 1
+        else: fail_n += 1
+
+    guide = os.path.join(root, "HOW_TO_START.txt")
+    with open(guide,"w",encoding="utf-8") as fh:
+        fh.write("ComfyUI installed at:\n  " + cdir + "\n\n")
+        fh.write("To start:\n  cd " + cdir + "\n  python main.py\n\n")
+        fh.write("Then open:\n  http://127.0.0.1:8188\n\n")
+        fh.write("Drag any .json workflow into the browser to load it.\n")
+        fh.write("Use Manager node to install more packs.\n")
+    print("\n  " + clr("startup guide -> " + guide, DIM))
+    print("\n  " + clr("done!  " + str(ok_n) + " packs installed"
+                        + ("  " + str(fail_n) + " failed" if fail_n else ""), G))
+    print("\n  " + clr("to start: cd " + cdir + " && python main.py", W))
+    print("  " + clr("then: http://127.0.0.1:8188", DIM) + "\n")
+    pause()
+
+
+# ── pipeline builder ──────────────────────────────────────────────
+PIPE_STEPS = {
+    "resize":   "Resize Images and Videos",
+    "caption":  "Auto Caption with BLIP",
+    "train":    "Standard LoRA Train",
+    "finetune": "Fine Tune  Dual LoRA",
+    "generate": "Generate Images",
+}
+SKEYS = list(PIPE_STEPS.keys())
+SLABS = list(PIPE_STEPS.values())
+
+
+def _build_step_cfg(key, base):
+    cfg = dict(base)
+    if key == "resize":
+        sec("Resize Settings")
+        cfg["resize_w"] = _ask("target width", 512, int)
+        cfg["resize_h"] = _ask("target height", 512, int)
+    elif key == "caption":
+        sec("Caption Settings")
+        cfg["caption_batch"] = _ask("batch size", 4, int)
+    elif key == "train":
+        mid, prof = _pick_model_search()
+        wts       = _pick_weights(cfg["checkpoint_dir"])
+        settings  = _get_train_settings(cfg["checkpoint_dir"], prof)
+        cfg.update(dict(model_id=mid, weights_path=wts, _profile=prof, **settings))
+    elif key == "finetune":
+        mid, prof = _pick_model_search()
+        elo       = _pick_existing_lora(cfg["checkpoint_dir"])
+        settings  = _get_ft_settings(cfg["checkpoint_dir"], prof)
+        cfg.update(dict(model_id=mid, existing_lora=elo, _profile=prof, **settings))
+    elif key == "generate":
+        mid, _    = _pick_model_search()
+        lp        = _pick_lora([cfg["checkpoint_dir"]])
+        outd      = _pick_out_dir(os.path.join(cfg["checkpoint_dir"],"generated"), label="Where to Save Images")
+        sec("Generation Settings")
+        prompt = ""
+        while not prompt:
+            prompt = input("  " + clr("prompt: ", C)).strip()
+            if not prompt: print("  " + clr("required", R))
+        cfg.update(dict(model_id=mid, lora_path=lp, output_dir=outd, prompt=prompt,
+                        num_images=_ask("how many images", 4, int),
+                        steps=_ask("steps", 30, int),
+                        guidance=_ask("guidance scale", 7.5, float)))
     return cfg
 
 
-last_data_dir   = ""
-last_output_dir = ""
+def _run_step(key, cfg):
+    if key == "resize":    run_resize(cfg)
+    elif key == "caption": run_caption(cfg)
+    elif key == "train":   run_training(cfg)
+    elif key == "finetune":run_finetune(cfg)
+    elif key == "generate":run_generate(cfg)
 
 
-def flow_train(with_improvements=False):
-    global last_data_dir, last_output_dir
+def flow_pipeline():
+    sec("Pipeline Builder")
+    print("  " + clr("pick steps separated by commas, e.g.  1,2,4  or  3,5\n", DIM))
+    for i,lab in enumerate(SLABS,1): print("  " + clr(str(i),C) + "  " + lab)
+    print()
+    raw = input("  " + clr("steps to run: ", C)).strip()
+    if not raw: print("  " + clr("nothing picked",Y)); pause(); return
 
-    data_dir        = pick_data_dir(last_data_dir)
-    output_dir      = pick_output_dir(last_output_dir)
-    last_data_dir   = data_dir
-    last_output_dir = output_dir
+    chosen = []
+    for part in re.split(r"[,\s]+",raw):
+        part = part.strip()
+        if part.isdigit() and 1 <= int(part) <= len(SKEYS):
+            k = SKEYS[int(part)-1]
+            if k not in chosen: chosen.append(k)
+        elif part: print("  " + clr("skipping: " + part,Y))
+    if not chosen: print("  " + clr("nothing valid",R)); pause(); return
 
-    model_id = pick_model()
-    weights  = pick_weights(output_dir)
-    settings = pick_training_settings(output_dir)
-    cfg      = dict(model_id=model_id, weights_path=weights,
-                    data_dir=data_dir, checkpoint_dir=output_dir, **settings)
+    dd   = _pick_data_dir(_last["dd"])
+    od   = _pick_out_dir(_last["out"])
+    _last["dd"] = dd; _last["out"] = od
+    base = {"data_dir": dd, "checkpoint_dir": od}
 
-    if with_improvements:
-        cfg = pick_improvements(cfg)
+    cfgs = {}
+    for k in chosen:
+        print("\n  " + clr("setting up: " + PIPE_STEPS[k], Y))
+        cfgs[k] = _build_step_cfg(k, base)
 
-    _confirm_and_run(cfg, mode="train")
+    sec("Ready")
+    for i,k in enumerate(chosen,1): print("  " + clr(str(i),C) + "  " + PIPE_STEPS[k])
+    print()
+    input("  " + clr("enter to start the pipeline...", Y))
+
+    tot = str(len(chosen))
+    for i,k in enumerate(chosen,1):
+        print("\n  " + clr("[" + str(i) + "/" + tot + "]", C) + "  " + clr(PIPE_STEPS[k],W) + "...")
+        try: _run_step(k, cfgs[k])
+        except KeyboardInterrupt:
+            print("\n\n  " + clr("stopped. checkpoints are safe.",Y)); break
+        except Exception as ex:
+            print("\n  " + clr("error in " + k + ": " + str(ex),R))
+            if input("  " + clr("keep going? y/n [y]: ",C)).strip().lower() == "n": break
+
+    print("\n  " + clr("pipeline done.",G) + "\n")
+    pause()
+
+
+def _confirm_run(cfg, mode):
+    sec("Ready to Start")
+    for k,v in cfg.items():
+        if v not in (None,"") and not k.startswith("_"):
+            print("  " + clr(k,DIM) + " = " + clr(str(v),W))
+    input("\n  " + clr("enter to start...", Y))
+    try:
+        if mode == "finetune":   run_finetune(cfg)
+        elif mode == "generate": run_generate(cfg)
+        else:                    run_training(cfg)
+    except KeyboardInterrupt:
+        print("\n\n  " + clr("stopped. checkpoint saved.",Y))
+    pause()
+
+
+def flow_train(boost=False):
+    dd = _pick_data_dir(_last["dd"])
+    od = _pick_out_dir(_last["out"])
+    _last["dd"] = dd; _last["out"] = od
+    mid, prof = _pick_model_search()
+    wts       = _pick_weights(od)
+    settings  = _get_train_settings(od, prof)
+    cfg       = dict(model_id=mid, weights_path=wts, data_dir=dd,
+                     checkpoint_dir=od, _profile=prof, **settings)
+    if boost: cfg = _apply_boosts(cfg)
+    _confirm_run(cfg, "train")
 
 
 def flow_finetune():
-    global last_data_dir, last_output_dir
-
-    data_dir        = pick_data_dir(last_data_dir)
-    output_dir      = pick_output_dir(last_output_dir)
-    last_data_dir   = data_dir
-    last_output_dir = output_dir
-
-    model_id      = pick_model()
-    existing_lora = pick_existing_lora(output_dir)
-    settings      = pick_finetune_settings()
-    cfg           = dict(model_id=model_id, existing_lora=existing_lora,
-                         data_dir=data_dir, checkpoint_dir=output_dir, **settings)
-
-    _confirm_and_run(cfg, mode="finetune")
+    dd = _pick_data_dir(_last["dd"])
+    od = _pick_out_dir(_last["out"])
+    _last["dd"] = dd; _last["out"] = od
+    mid, prof = _pick_model_search()
+    elo       = _pick_existing_lora(od)
+    settings  = _get_ft_settings(od, prof)
+    cfg       = dict(model_id=mid, existing_lora=elo, data_dir=dd,
+                     checkpoint_dir=od, _profile=prof, **settings)
+    _confirm_run(cfg, "finetune")
 
 
 def flow_generate():
-    global last_output_dir
-
-    model_id   = pick_model()
-    lora_path  = pick_lora_for_generation([last_output_dir])
-    output_dir = pick_output_dir(
-        os.path.join(last_output_dir, "generated") if last_output_dir else "",
-        label="Image Output Folder"
-    )
-
-    section("Generation Settings")
+    mid, _  = _pick_model_search()
+    lp      = _pick_lora([_last["out"]])
+    outd    = _pick_out_dir(os.path.join(_last["out"],"generated") if _last["out"] else "",
+                             label="Where to Save Images")
+    sec("Generation Settings")
     prompt = ""
     while not prompt:
-        prompt = input(f"  {clr('Prompt', C)}: ").strip()
-        if not prompt:
-            print(f"  {clr('Prompt cannot be empty.', R)}")
-
-    num_images = ask("Number of images", 4, int)
-    steps      = ask("Inference steps", 30, int)
-    guidance   = ask("Guidance scale (CFG)", 7.5, float)
-
-    cfg = dict(
-        model_id=model_id, lora_path=lora_path,
-        output_dir=output_dir, prompt=prompt,
-        num_images=num_images, steps=steps, guidance=guidance
-    )
-
-    _confirm_and_run(cfg, mode="generate")
+        prompt = input("  " + clr("prompt: ", C)).strip()
+        if not prompt: print("  " + clr("required", R))
+    cfg = dict(model_id=mid, lora_path=lp, output_dir=outd, prompt=prompt,
+               num_images=_ask("how many images", 4, int),
+               steps=_ask("steps", 30, int),
+               guidance=_ask("guidance scale", 7.5, float))
+    _confirm_run(cfg, "generate")
 
 
-def _confirm_and_run(cfg, mode):
-    section("Summary")
-    for k, v in cfg.items():
-        if v is not None and v != "":
-            print(f"  {clr(k, DIM)} = {clr(str(v), W)}")
-
-    input(f"\n  {clr('Press Enter to start...', Y)}")
-
-    try:
-        if mode == "finetune":
-            run_finetune(cfg)
-        elif mode == "generate":
-            run_generate(cfg)
-        else:
-            run_training(cfg)
-    except KeyboardInterrupt:
-        print(f"\n\n  {clr('Stopped. Latest checkpoint preserved.', Y)}\n")
-
-    input(f"\n  {clr('Press Enter to return to menu...', DIM)}")
+def flow_resize():
+    dd = _pick_data_dir(_last["dd"]); _last["dd"] = dd
+    sec("Resize Settings")
+    w = _ask("width",  512, int)
+    h = _ask("height", 512, int)
+    sec("Ready")
+    print("  " + clr("folder", DIM) + "  " + dd)
+    print("  " + clr("size  ", DIM) + "  " + str(w) + "x" + str(h))
+    input("\n  " + clr("enter to start...", Y))
+    try:    run_resize({"data_dir":dd,"resize_w":w,"resize_h":h})
+    except KeyboardInterrupt: print("\n\n  " + clr("stopped",Y))
+    pause()
 
 
+def flow_caption():
+    dd = _pick_data_dir(_last["dd"]); _last["dd"] = dd
+    batch = _ask("batch size", 4, int)
+    input("\n  " + clr("enter to start...", Y))
+    try:    run_caption({"data_dir":dd,"caption_batch":batch})
+    except KeyboardInterrupt: print("\n\n  " + clr("stopped",Y))
+    pause()
+
+
+# ── persistent state (last used dirs) ────────────────────────────
+_last = {"dd": "", "out": ""}
+
+
+# ── main menu ─────────────────────────────────────────────────────
 def main_menu():
-    global last_data_dir, last_output_dir
-
     while True:
         print_header()
 
-        img_count = sum(
-            len(glob.glob(os.path.join(last_data_dir, f"*.{ext}")))
-            for ext in ["png", "jpg", "jpeg", "webp", "bmp", "tiff"]
-        ) if last_data_dir else 0
+        ni = 0
+        if _last["dd"]:
+            ni = sum(len(glob.glob(os.path.join(_last["dd"],"*."+e))) for e in IEXT)
+        _, step = find_latest(_last["out"]) if _last["out"] else (None, 0)
 
-        _, step  = find_latest_checkpoint(last_output_dir) if last_output_dir else (None, 0)
-        ckpt_str = clr(f"step_{step}", G) if step else clr("none", DIM)
-        data_str = clr(last_data_dir, W) if last_data_dir else clr("not set", DIM)
-        out_str  = clr(last_output_dir, W) if last_output_dir else clr("not set", DIM)
+        print("  " + clr("data   ",DIM) + (clr(_last["dd"],W) if _last["dd"] else clr("not set",DIM)))
+        if _last["dd"]: print("  " + clr("images ",DIM) + clr(str(ni),W))
+        print("  " + clr("output ",DIM) + (clr(_last["out"],W) if _last["out"] else clr("not set",DIM)))
+        if _last["out"]: print("  " + clr("ckpt   ",DIM) + (clr("step "+str(step),G) if step else clr("none",DIM)))
 
-        print(f"  {clr('Data dir   ', DIM)} {data_str}")
-        if last_data_dir:
-            print(f"  {clr('Images     ', DIM)} {clr(str(img_count), W)}")
-        print(f"  {clr('Output dir ', DIM)} {out_str}")
-        if last_output_dir:
-            print(f"  {clr('Checkpoint ', DIM)} {ckpt_str}")
-
-        print(f"\n  {clr('─'*50, DIM)}")
-        print(f"  {clr('1', C)}.  Train          — standard LoRA training, auto-resume")
-        print(f"  {clr('2', C)}.  Train + Boost  — pick quality improvements first")
-        print(f"  {clr('3', C)}.  Fine-Tune      — dual LoRA, VAE latent cache, video support")
-        print(f"  {clr('4', C)}.  Generate       — run inference with any LoRA")
-        print(f"  {clr('5', C)}.  VRAM info")
-        print(f"  {clr('6', C)}.  Exit")
+        print("\n  " + clr("─" * 50, DIM))
+        print("  " + clr("1",C) + "  Pipeline Builder       chain any steps together")
+        print("  " + clr("─" * 50, DIM))
+        print("  " + clr("2",C) + "  Resize                 resize images and videos")
+        print("  " + clr("3",C) + "  Caption                auto-caption with BLIP")
+        print("  " + clr("4",C) + "  Train                  standard LoRA training")
+        print("  " + clr("5",C) + "  Train + Boosts         train with quality upgrades")
+        print("  " + clr("6",C) + "  Fine Tune              dual LoRA, VAE cache, model-aware")
+        print("  " + clr("7",C) + "  Generate               make images from any LoRA")
+        print("  " + clr("─" * 50, DIM))
+        print("  " + clr("8",C) + "  ComfyUI Setup          install ComfyUI and all node packs")
+        print("  " + clr("9",C) + "  Image Editor           face swap, restore, img2img, filters")
+        print("  " + clr("─" * 50, DIM))
+        print("  " + clr("t",C) + "  Tutorial               how everything works (Ctrl+U tip inside)")
+        print("  " + clr("v",C) + "  VRAM Info              current GPU memory")
+        print("  " + clr("g",C) + "  GPU Presets            recommended settings by GPU size")
+        print("  " + clr("0",C) + "  Exit")
         print()
 
-        ch = input(f"  {clr('›', C)} ").strip()
+        ch = input("  " + clr(">", C) + " ").strip().lower()
 
-        if ch == "1":
-            try:
-                flow_train()
-            except Exception as e:
-                print(f"\n  {clr(f'Error: {e}', R)}\n")
-                input(f"  {clr('Press Enter...', DIM)}")
+        def wrap(fn):
+            try: fn()
+            except Exception as ex:
+                print("\n  " + clr("error: " + str(ex),R) + "\n")
+                import traceback; traceback.print_exc()
+                pause()
 
-        elif ch == "2":
-            try:
-                flow_train(with_improvements=True)
-            except Exception as e:
-                print(f"\n  {clr(f'Error: {e}', R)}\n")
-                input(f"  {clr('Press Enter...', DIM)}")
-
-        elif ch == "3":
-            try:
-                flow_finetune()
-            except Exception as e:
-                print(f"\n  {clr(f'Error: {e}', R)}\n")
-                input(f"  {clr('Press Enter...', DIM)}")
-
-        elif ch == "4":
-            try:
-                flow_generate()
-            except Exception as e:
-                print(f"\n  {clr(f'Error: {e}', R)}\n")
-                input(f"  {clr('Press Enter...', DIM)}")
-
-        elif ch == "5":
-            section("VRAM Info")
+        if   ch == "1": wrap(flow_pipeline)
+        elif ch == "2": wrap(flow_resize)
+        elif ch == "3": wrap(flow_caption)
+        elif ch == "4": wrap(lambda: flow_train(False))
+        elif ch == "5": wrap(lambda: flow_train(True))
+        elif ch == "6": wrap(flow_finetune)
+        elif ch == "7": wrap(flow_generate)
+        elif ch == "8":
+            try:    install_comfyui()
+            except KeyboardInterrupt: print("\n\n  " + clr("cancelled",Y))
+            except Exception as ex:   print("\n  " + clr("error: " + str(ex),R)); pause()
+        elif ch == "9": wrap(terminal_image_editor)
+        elif ch == "t": show_tutorial()
+        elif ch == "g": show_vram_table(); pause()
+        elif ch == "v":
+            sec("Current GPU Usage")
             if torch.cuda.is_available():
-                p     = torch.cuda.get_device_properties(0)
-                total = p.total_memory / 1024**3
-                free  = torch.cuda.mem_get_info()[0] / 1024**3
-                print(f"  {clr('GPU          ', DIM)} {p.name}")
-                print(f"  {clr('VRAM Total   ', DIM)} {total:.1f} GB")
-                print(f"  {clr('VRAM Used    ', DIM)} {total - free:.1f} GB")
-                print(f"  {clr('VRAM Free    ', DIM)} {free:.1f} GB")
-                print(f"  {clr('CUDA         ', DIM)} {torch.version.cuda}")
-                print(f"  {clr('PyTorch      ', DIM)} {torch.__version__}")
-                print(f"\n  {vram_str()}")
+                p   = torch.cuda.get_device_properties(0)
+                tot = p.total_memory/1024**3
+                fr  = torch.cuda.mem_get_info()[0]/1024**3
+                print("  " + clr("GPU   ",DIM) + p.name)
+                print("  " + clr("total ",DIM) + str(round(tot,1)) + "GB")
+                print("  " + clr("used  ",DIM) + str(round(tot-fr,1)) + "GB")
+                print("  " + clr("free  ",DIM) + str(round(fr,1)) + "GB")
+                print("  " + clr("cuda  ",DIM) + str(torch.version.cuda))
+                print("  " + clr("torch ",DIM) + str(torch.__version__))
+                print("\n  " + gpu_bar())
             else:
-                print(f"  {clr('No CUDA GPU detected.', R)}")
-            input("\n  Press Enter...")
-
-        elif ch == "6":
-            print(f"\n  {clr('Goodbye!', C)}\n")
-            sys.exit(0)
+                print("  " + clr("no CUDA GPU detected",R))
+            pause()
+        elif ch == "0":
+            print("\n  " + clr("bye",C) + "\n"); import sys; sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -1265,11 +1993,11 @@ if __name__ == "__main__":
     try:
         main_menu()
     except KeyboardInterrupt:
-        print(f"\n\n  {clr('Interrupted.', Y)}\n")
-        sys.exit(0)
-    except Exception as e:
+        print("\n\n  " + clr("interrupted, bye",Y) + "\n")
+        import sys; sys.exit(0)
+    except Exception as ex:
         import traceback
-        print(f"\n  {clr(f'Fatal error: {e}', R)}\n")
+        print("\n  " + clr("fatal: " + str(ex),R) + "\n")
         traceback.print_exc()
-        input("\n  Press Enter to exit...")
-        sys.exit(1)
+        pause("\n  press enter to exit...")
+        import sys; sys.exit(1)
