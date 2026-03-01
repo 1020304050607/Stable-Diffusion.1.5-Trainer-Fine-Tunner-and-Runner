@@ -7,9 +7,9 @@ import os, sys, subprocess, shutil, re, time, json, glob, struct
 import threading, warnings, logging
 from pathlib import Path
 
-os.system("")   # windows needs this or ANSI codes print as garbage
+os.system("")
 
-# ── colors ──────────────────────────────────────────────────────
+#colors
 R    = "\033[91m"
 G    = "\033[92m"
 Y    = "\033[93m"
@@ -28,7 +28,7 @@ def sec(title):
 def clear():          os.system("cls" if os.name == "nt" else "clear")
 def pause(m="  press enter..."):  input(m)
 
-# ── packages ─────────────────────────────────────────────────────
+#packages
 PACKAGES = [
     ("tqdm",         "tqdm"),
     ("PIL",          "Pillow"),
@@ -47,8 +47,6 @@ def can_import(mod):
     except: return False
 
 def pip_install(label, args):
-    # pip sends download progress to stderr not stdout which is why
-    # old versions got stuck at 0% - fix is to read both streams in threads
     cmd  = [sys.executable, "-m", "pip", "install",
             "--no-warn-script-location", "--no-cache-dir"] + args
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -142,7 +140,7 @@ def boot():
 
 boot()
 
-# ── real imports ─────────────────────────────────────────────────
+#imports
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -180,7 +178,7 @@ VEXT = ["mp4","mov","avi","mkv","webm"]
 MAX_VFRAMES = 10
 
 
-# ── gpu helpers ──────────────────────────────────────────────────
+#gpu helpers
 def gpu_gb():
     if not torch.cuda.is_available(): return 0.0
     return torch.cuda.get_device_properties(0).total_memory / 1024**3
@@ -199,10 +197,7 @@ def gpu_used():
     return (gpu_gb() - torch.cuda.mem_get_info()[0]/1024**3)
 
 
-# ── model type detection ─────────────────────────────────────────
-# reads safetensors header (8 bytes = header length, then JSON)
-# without loading weights into VRAM so it works on any machine
-
+#model type detection
 _PROFILES = {
     "sd1":  dict(label="SD 1.x  (512px native)",   native=512,  min_res=512,  max_res=768,
                  safe_rank=128, min_rank=4, safe_bs=2, min_bs=1, te_min_rank=4,  flux=False,
@@ -258,7 +253,7 @@ def detect_from_id(model_id):
     return _PROFILES["sd1"].copy()
 
 
-# ── vram presets (profile-aware) ─────────────────────────────────
+#vram presets
 def vram_preset(prof=None):
     gb = gpu_gb()
     p  = prof or _DEFAULT
@@ -315,7 +310,7 @@ def show_vram_table():
         print("  " + clr("your card: " + str(round(gb,1)) + "GB  -> auto-filling for: " + p["label"], Y))
 
 
-# ── header ───────────────────────────────────────────────────────
+#header
 def print_header():
     clear()
     print(clr("=" * 60, C))
@@ -326,7 +321,7 @@ def print_header():
         print("  " + clr("VRAM ", DIM) + gpu_bar())
     print()
 
-# ── resize ───────────────────────────────────────────────────────
+#resize
 def run_resize(cfg):
     sec("Resize Images and Videos")
     td  = cfg["data_dir"]
@@ -395,7 +390,7 @@ def run_resize(cfg):
                       "videos " + str(vok) + " ok " + str(vfail) + " failed", G) + "\n")
 
 
-# ── caption ──────────────────────────────────────────────────────
+#caption
 def run_caption(cfg):
     sec("Auto Caption")
     from transformers import (BlipProcessor, BlipForConditionalGeneration,
@@ -462,17 +457,14 @@ def run_caption(cfg):
                         "  avg " + str(round(elapsed/max(len(media),1),2)) + "s each", G) + "\n")
 
 
-# ── image edit (terminal) ─────────────────────────────────────────
-# face swap, face restore, img2img, filters - all in terminal
-# no browser, everything interactive in the console
-
+#image edit
 def terminal_image_editor(cfg=None):
     """
     Pure terminal image editing suite.
     Face swap / restore / img2img / filters.
     Ctrl+U uploads a new image at any prompt.
     """
-    import msvcrt  # will fail on linux - we handle that
+    import msvcrt
     _msvcrt = True
     try:    import msvcrt
     except: _msvcrt = False
@@ -515,7 +507,6 @@ def terminal_image_editor(cfg=None):
         if ch == "0": break
 
         elif ch == "1":
-            # face swap using insightface + inswapper
             sec("Face Swap")
             print("  " + clr("needs insightface + onnxruntime installed", DIM))
             print("  " + clr("source = the face you want to USE", DIM))
@@ -589,7 +580,6 @@ def terminal_image_editor(cfg=None):
             pause()
 
         elif ch == "2":
-            # face restore using GFPGAN or CodeFormer
             sec("Face Restore")
             print("  " + clr("tries GFPGAN first, falls back to PIL sharpening if not installed", DIM) + "\n")
             dst_path, dst_img = pick_image("image to restore faces in")
@@ -608,7 +598,6 @@ def terminal_image_editor(cfg=None):
                 except ImportError:
                     print("  " + clr("GFPGAN not installed, using PIL sharpen instead", Y))
                     print("  " + clr("install gfpgan for better results: pip install gfpgan", DIM))
-                    # basic PIL face-area sharpen
                     out_img = dst_img.filter(ImageFilter.SHARPEN)
                     out_img = ImageEnhance.Sharpness(out_img).enhance(2.0)
                     out_img = ImageEnhance.Contrast(out_img).enhance(1.1)
@@ -619,7 +608,6 @@ def terminal_image_editor(cfg=None):
             pause()
 
         elif ch == "3":
-            # img2img in terminal
             sec("img2img  |  Re-draw with a Prompt")
             if not mid:
                 mid, _ = _pick_model_search()
@@ -639,7 +627,6 @@ def terminal_image_editor(cfg=None):
                     mid, torch_dtype=torch.float16, safety_checker=None
                 ).to(device)
                 res_w, res_h = dst_img.size
-                # keep aspect ratio, round to 64
                 max_s = 768
                 scale = min(max_s/res_w, max_s/res_h)
                 nw    = int(res_w * scale / 64) * 64
@@ -663,7 +650,6 @@ def terminal_image_editor(cfg=None):
             pause()
 
         elif ch == "4":
-            # basic PIL filters
             sec("Basic Filters")
             dst_path, dst_img = pick_image("image to edit")
             print()
@@ -704,7 +690,6 @@ def terminal_image_editor(cfg=None):
             pause()
 
         elif ch == "5":
-            # batch face restore
             sec("Batch Face Restore")
             folder = _pick_data_dir()
             imgs   = sum([glob.glob(os.path.join(folder,"*."+e)) for e in IEXT], [])
@@ -739,7 +724,6 @@ def terminal_image_editor(cfg=None):
             pause()
 
         elif ch == "6":
-            # resize single image
             sec("Resize Single Image")
             src_path, src_img = pick_image("image to resize")
             w = _ask("width", 512, int)
@@ -753,7 +737,7 @@ def terminal_image_editor(cfg=None):
             pause()
 
 
-# ── datasets ──────────────────────────────────────────────────────
+#datasets
 class LatentCacheDataset(Dataset):
     def __init__(self, folder, tok, vae, res, ckd):
         self.tok       = tok
@@ -853,7 +837,7 @@ class ImageCaptionDataset(Dataset):
         return img, tok.input_ids[0]
 
 
-# ── checkpoint helpers ────────────────────────────────────────────
+#checkpoint helpers
 def find_latest(folder):
     hits = []
     for pat in ["step_*.pt","step_*.safetensors"]:
@@ -892,7 +876,7 @@ def save_pt(unet, folder, step):
     print("  " + clr("checkpoint saved at step " + str(step), Y))
 
 
-# ── validated ask (caps settings that would break the model) ──────
+#validated ask
 def _validated_ask(label, default, cast, prof, field):
     """
     Ask for a value but warn and cap if it would break the chosen model.
@@ -942,7 +926,7 @@ def _ask(label, default, cast=str):
     try: return cast(raw)
     except: return default
 
-# ── fine tune ─────────────────────────────────────────────────────
+#fine tune
 def run_finetune(cfg):
     sec("Fine Tune  |  Dual LoRA + VAE Cache")
     dd   = cfg["data_dir"];          ckd  = cfg["checkpoint_dir"]
@@ -1081,7 +1065,7 @@ def run_finetune(cfg):
     print("\n  " + clr("fine tuning done.", G) + "\n")
 
 
-# ── standard train ────────────────────────────────────────────────
+#standard train
 def run_training(cfg):
     sec("Standard LoRA Training")
     dd   = cfg["data_dir"];        ckd  = cfg["checkpoint_dir"]
@@ -1221,7 +1205,7 @@ def run_training(cfg):
     print("\n  " + clr("training done.", G) + "\n")
 
 
-# ── generate ──────────────────────────────────────────────────────
+#generate
 def run_generate(cfg):
     sec("Generate Images")
     mid    = cfg["model_id"];  lp = cfg.get("lora_path")
@@ -1264,7 +1248,7 @@ def run_generate(cfg):
     print("\n  " + clr("done.  saved to " + str(odir.resolve()), G) + "\n")
 
 
-# ── HuggingFace search ────────────────────────────────────────────
+#huggingface search
 def hf_search(query):
     try:
         import urllib.request, urllib.parse
@@ -1351,7 +1335,7 @@ def _pick_model_search():
             print("  " + clr("not valid", R))
 
 
-# ── input helpers ─────────────────────────────────────────────────
+#input helpers
 def _pick_data_dir(last=""):
     sec("Training Data Folder")
     print("  " + clr("path to folder with your images (or videos)", DIM))
@@ -1448,7 +1432,6 @@ def _get_train_settings(ckd, prof=None):
     latest, step = find_latest(ckd)
     if latest: print("  " + clr("checkpoint at step " + str(step) + ", will auto-resume\n", G))
 
-    # standard train: resolution is flexible, boosts available
     res  = _ask("resolution (512 / 768 / 1024)",  p["res"],   int)
     bs   = _ask("batch size",                     p["bs"],    int)
     ms   = _ask("total steps",                    p["steps"], int)
@@ -1475,7 +1458,6 @@ def _get_ft_settings(ckd, prof=None):
             print("  " + clr("minimum resolution for this model: " + str(prof["min_res"]) + "px", R))
     print("  " + clr("\npress enter to accept each default\n", DIM))
 
-    # fine tune: resolution is ENFORCED at model minimum (will error below it)
     res  = _validated_ask("resolution",             p["res"],   int,   pr, "res")
     bs   = _ask("batch size",                       p["bs"],    int)
     ga   = _ask("gradient accumulation",            p["ga"],    int)
@@ -1521,7 +1503,7 @@ def _apply_boosts(cfg):
     if cfg.get("resolution",0) >= 1024: cfg["batch_size"] = 1
     return cfg
 
-# ── tutorial (Ctrl+U style - terminal tutorial + image upload guide) ─
+#tutorial
 def show_tutorial():
     clear()
     print(clr("=" * 60, C))
@@ -1598,7 +1580,7 @@ def show_tutorial():
     pause("")
 
 
-# ── comfyui installer ─────────────────────────────────────────────
+# comfyui installer
 CNODES = [
     ("ComfyUI Manager",          "https://github.com/ltdrdata/ComfyUI-Manager"),
     ("Impact Pack",              "https://github.com/ltdrdata/ComfyUI-Impact-Pack"),
@@ -1657,8 +1639,6 @@ def install_comfyui():
     root    = raw if raw else default
     cdir    = os.path.join(root, "ComfyUI")
     ndir    = os.path.join(cdir, "custom_nodes")
-
-    # step 1: pip packages
     sec("Step 1/3  pip packages")
     print("  " + clr("face tools and upscaling deps\n", DIM))
     for mod, pkg, warn in CFACE:
@@ -1679,7 +1659,6 @@ def install_comfyui():
                     if ln.strip(): print("  " + clr(ln, Y))
                 print()
 
-    # step 2: ComfyUI core
     sec("Step 2/3  ComfyUI core")
     os.makedirs(root, exist_ok=True)
     if os.path.isdir(cdir):
@@ -1701,7 +1680,6 @@ def install_comfyui():
                 try:   __import__(bare); print("  " + clr("ok  ",G) + r)
                 except: pip_install(r, [r])
 
-    # step 3: node packs
     sec("Step 3/3  Node Packs")
     os.makedirs(ndir, exist_ok=True)
     print("  " + clr("cloning " + str(len(CNODES)) + " packs into " + ndir + "\n", DIM))
@@ -1725,7 +1703,7 @@ def install_comfyui():
     pause()
 
 
-# ── pipeline builder ──────────────────────────────────────────────
+#pipeline builder
 PIPE_STEPS = {
     "resize":   "Resize Images and Videos",
     "caption":  "Auto Caption with BLIP",
@@ -1906,11 +1884,11 @@ def flow_caption():
     pause()
 
 
-# ── persistent state (last used dirs) ────────────────────────────
+# persistent state
 _last = {"dd": "", "out": ""}
 
 
-# ── main menu ─────────────────────────────────────────────────────
+# main menu
 def main_menu():
     while True:
         print_header()
@@ -2001,3 +1979,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         pause("\n  press enter to exit...")
         import sys; sys.exit(1)
+
