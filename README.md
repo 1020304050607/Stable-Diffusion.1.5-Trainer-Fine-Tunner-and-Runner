@@ -32,7 +32,7 @@ flies on 3090 and 4090 gpus. 8gb cards can do it at 512 res low batch but itll c
 
 janky stuff i know about  
 - progress bar sometimes freaks out in windows cmd prefferablt use windows terminal or my favourite, powershell instead 
-- super high steps like 200 can make images look weird sometimes probably the scheduler being dumb, not my code  
+- super high steps like 999999 can make images look weird sometimes probably the scheduler being dumb, not my code  
 - no negative prompts, controlnet, ip-adapter or any of that fancy stuff yet maybe one day, idk
 
 if you make something cool, cursed, or straight-up weird with it, drop it here or dm me, i wanna see.  
